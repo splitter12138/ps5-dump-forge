@@ -1,0 +1,19 @@
+# PS5 Dump Forge — docker-compose
+#
+#   docker compose up -d        # start the web UI on http://localhost:8095
+#   docker compose down          # stop
+#
+# Put game folders under ./data/ and they appear in the UI's file browser.
+# To serve additional roots, override the command:
+#   command: ["serve", "--port", "8095", "--root", "/data", "--root", "/extra"]
+
+services:
+  forge:
+    build: .
+    image: ps5-dump-forge:latest
+    container_name: ps5-dump-forge
+    ports:
+      - "8095:8095"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

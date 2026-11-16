@@ -21,13 +21,14 @@ use crate::{CORRUPT, UNSUPPORTED_CODEC, err};
 /// alternates between an inode table block and a directory block.
 // ponytail: 4-slot ring (1 MiB), no LRU; widen if random access patterns show up
 const DECODED_CACHE: usize = 4;
-/// The largest layout descriptor read: nine bytes per block record, so 32 MiB covers ~3.7 M
-/// stored blocks, about 900 GiB of mount (Spider-Man 2's 272 GB mount is a 10 MB descriptor).
-/// Sparse blocks (zeros, no record) are not bounded by it: boundary offsets are 40-bit, so a
-/// mount holds at most ~4.2 M of them (1 TiB / 256 KiB), ~7.9 M blocks in all.
-// ponytail: 32 MiB descriptor, held whole with ~100 B per block while it is walked (~0.8 GB at
-// the ~7.9 M-block worst case)
-pub(crate) const MAX_DESCRIPTOR: u64 = 32 << 20;
+/// The most opening a layout descriptor may hold at once, the descriptor itself included, as
+/// [`open_cost`] bounds it from the header's counts: three quarters of a job's 512 MiB. Only
+/// the `KBlock`s (32 B each) stay once it is open. A descriptor's size says little by itself:
+/// Spider-Man 2's 272 GB mount is a 10 MB descriptor, FF VII Rebirth's a 34 MB one.
+// ponytail: ~3 M blocks when files are few (~375 GB of mount at 256 KiB blocks, each counted
+// once as a ublock and once as a record), fewer with many small files;
+// building the `KBlock`s during the walk (one block list, not two) would lift it
+pub(crate) const MAX_OPEN: u64 = 384 << 20;
 /// The compression type every layout this reader decodes declares (Kraken, or no payload).
 const COMP_KRAKEN: u64 = 2;
 
@@ -41,6 +42,8 @@ struct KBlock {
     even_lz: bool,
     odd_lz: bool,
     mode_bits: u8,
+    /// Its byte shuffle (`kraken_image::SHUFFLES`), undone after decoding.
+    shuffle: u8,
 }
 
 pub(crate) struct Kraken {
@@ -58,15 +61,16 @@ pub(crate) enum Layout {
 }
 
 impl Layout {
-    /// Which layout `blob` describes for an image of `image_size` stored bytes.
-    pub fn parse(blob: &[u8], image_size: u64) -> Result<Self> {
+    /// Which layout `blob` describes for an image of `image_size` stored bytes. A Kraken
+    /// layout drops `blob` once it is walked, before its own block list is built.
+    pub fn parse(blob: Vec<u8>, image_size: u64) -> Result<Self> {
         if blob.len() < 16 {
             return Err(err(
                 CORRUPT,
                 "the layout descriptor is shorter than its header",
             ));
         }
-        let (w0, w1) = (le64(blob, 0), le64(blob, 8));
+        let (w0, w1) = (le64(&blob, 0), le64(&blob, 8));
         let comp = (w0 >> 24) & 3;
         if comp != COMP_KRAKEN {
             let name = match comp {
@@ -81,9 +85,35 @@ impl Layout {
                 ),
             ));
         }
-        if is_kraken(blob, w0, w1) {
-            return Ok(Self::Kraken(Kraken::new(blob, image_size)?));
+        let shape = shape(&blob, w0, w1);
+        let len = blob.len() as u64;
+        let cost = match shape {
+            Shape::Kraken => open_cost(true, len, w0, w1),
+            Shape::Flat => open_cost(false, len, w0, w1),
+            // The walk holds a copy of the blob too.
+            Shape::Either => (open_cost(true, len, w0, w1).saturating_add(len))
+                .max(open_cost(false, len, w0, w1)),
+        };
+        if cost > MAX_OPEN {
+            return Err(err(
+                CORRUPT,
+                format!(
+                    "the layout descriptor ({} bytes) may need {} MiB to read, more than the {} MiB allowed",
+                    blob.len(),
+                    cost >> 20,
+                    MAX_OPEN >> 20
+                ),
+            ));
         }
+        let kraken_error = match shape {
+            Shape::Kraken => return Ok(Self::Kraken(Kraken::new(blob, image_size)?)),
+            Shape::Flat => None,
+            // Walked from a copy: the flat parser needs the blob if the walk fails.
+            Shape::Either => match Kraken::new(blob.clone(), image_size) {
+                Ok(k) => return Ok(Self::Kraken(k)),
+                Err(e) => Some(e),
+            },
+        };
         // `naps::parse` sizes its first table by the header before checking the blob; check
         // that table (and the shuffle one) fits first. Both counts are small fields.
         let outer = (w1 & 0xFF_FFFF) as usize;
@@ -94,37 +124,99 @@ impl Layout {
                 "the layout descriptor is shorter than its tables",
             ));
         }
-        let layout = naps::parse(blob).map_err(|e| {
-            err(
-                CORRUPT,
-                format!("the layout descriptor does not parse: {e}"),
-            )
-        })?;
-        Ok(Self::Flat(layout))
+        match naps::parse(&blob) {
+            Ok(layout) => Ok(Self::Flat(layout)),
+            Err(e) => Err(kraken_error.unwrap_or_else(|| {
+                err(
+                    CORRUPT,
+                    format!("the layout descriptor does not parse: {e}"),
+                )
+            })),
+        }
     }
 }
 
-/// The Kraken descriptor's mark: after the boundary tables, padded to eight bytes, the ublock
-/// size `0x040000` as three bytes, then the records (see `kraken_image::layout`). The flat
-/// descriptor has records straight after its tables.
-fn is_kraken(blob: &[u8], w0: u64, w1: u64) -> bool {
+/// Which reader a descriptor is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Kraken,
+    Flat,
+    /// Sized like both: walked as Kraken first, else parsed flat.
+    Either,
+}
+
+/// How to tell the two descriptors apart. A Kraken one pads its boundary tables to eight
+/// bytes, then three bytes (`00 00 04` in every plain build measured; other values from other
+/// builders, see `kraken_image::describe`), then its records, then pads to eight bytes; the
+/// flat one has its records straight after its tables (one `u2c` group more when the ublock
+/// count isn't a multiple of eight) and ends at its last record. So `00 00 04` there is Kraken,
+/// and so is any other value unless the blob is exactly the flat size.
+fn shape(blob: &[u8], w0: u64, w1: u64) -> Shape {
     // Every count is a 24-bit field, so none of this can overflow.
     let files = (w0 & 0xFF_FFFF) as usize + 1;
+    let shuffle = ((w0 >> 28) & 0xF) as usize;
     let ublocks = ((w0 >> 32) & 0xFF_FFFF) as usize;
     let outer = (w1 & 0xFF_FFFF) as usize;
-    let u2c_end = 16 + outer * 8 + files * 6 + (ublocks / 8 + 1) * 10;
-    let rec_at = u2c_end.next_multiple_of(8) + 3;
-    blob.get(rec_at - 3..rec_at) == Some(&[0, 0, 4][..])
+    let records = ((w1 >> 24) & 0xFF_FFFF) as usize + 2;
+    let fidx_end = 16 + (outer + shuffle) * 8 + files * 6;
+    let rec_at = (fidx_end + (ublocks / 8 + 1) * 10).next_multiple_of(8) + 3;
+    let flat_len = fidx_end + (ublocks.div_ceil(8) + 1) * 10 + records * 9;
+    match blob.get(rec_at - 3..rec_at) {
+        Some([0, 0, 4]) => Shape::Kraken,
+        Some(_) if blob.len() >= rec_at + records * 9 => {
+            if blob.len() == flat_len {
+                Shape::Either
+            } else {
+                Shape::Kraken
+            }
+        }
+        _ => Shape::Flat,
+    }
+}
+
+/// The most opening a descriptor of `len` bytes with header words `w0`, `w1` holds at once.
+///
+/// Kraken: the larger of the walk (the blob, `describe`'s boundary tables, per file: entries,
+/// sorted bounds, sparse extents; the shuffle table's ids, at most 15 B; every block as a
+/// `DescribedBlock`, its Vec up to twice its length while it grows) and what follows it (the
+/// blob dropped, every block a `KBlock` too).
+/// A block never crosses a boundary and is at most 256 KiB; one may end sooner only where the
+/// next record starts (smaller blocks), so there are at most ublocks + files + 1 + records;
+/// `describe` refuses a ublock count the mount's end disagrees with before it walks.
+/// Flat: the blob and `naps::Layout`'s tables, the boundary one sized by what the blob has room
+/// for.
+fn open_cost(kraken: bool, len: u64, w0: u64, w1: u64) -> u64 {
+    use std::mem::size_of;
+    // Every count is a 24-bit field, so only `len` and its terms can overflow; they saturate.
+    let files = (w0 & 0xFF_FFFF) + 1;
+    let ublocks = (w0 >> 32) & 0xFF_FFFF;
+    if kraken {
+        let records = ((w1 >> 24) & 0xFF_FFFF) + 2;
+        let per_file = size_of::<(u64, u8)>() + size_of::<u64>() + size_of::<(u64, u64)>();
+        let blocks = ublocks + files + 1 + records;
+        let described = blocks * 2 * size_of::<DescribedBlock>() as u64;
+        let walk = len.saturating_add(files * per_file as u64 + 15 + described);
+        return walk.max(described + blocks * size_of::<KBlock>() as u64);
+    }
+    let outer = (w1 & 0xFF_FFFF) + ((w0 >> 28) & 0xF);
+    let cblocks = ((w1 >> 24) & 0xFF_FFFF) + 2;
+    let tables = outer * 8
+        + (ublocks / 8 + 2) * size_of::<(u32, [u8; 7])>() as u64
+        + cblocks * size_of::<naps::Cblock>() as u64;
+    len.saturating_add((len / 6).saturating_mul(size_of::<(u64, u8)>() as u64))
+        .saturating_add(tables)
 }
 
 impl Kraken {
-    fn new(blob: &[u8], image_size: u64) -> Result<Self> {
-        let described = kraken_image::describe(blob).map_err(|e| {
+    fn new(blob: Vec<u8>, image_size: u64) -> Result<Self> {
+        let described = kraken_image::describe(&blob).map_err(|e| {
             err(
                 CORRUPT,
                 format!("the Kraken layout descriptor does not walk: {e}"),
             )
         })?;
+        // Nothing borrows it any more; up to `MAX_OPEN` bytes freed before `blocks` is taken.
+        drop(blob);
         let mut blocks = Vec::with_capacity(described.len());
         let mut end = 0u64;
         for b in described {
@@ -157,6 +249,7 @@ impl Kraken {
                 even_lz: b.even_lz,
                 odd_lz: b.odd_lz,
                 mode_bits: b.mode_bits,
+                shuffle: b.shuffle,
             });
         }
         Ok(Self {
@@ -174,6 +267,17 @@ impl Kraken {
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// The stored byte ranges behind mount bytes `off..off + len`.
+    pub fn stored(&self, off: u64, len: u64) -> impl Iterator<Item = std::ops::Range<u64>> + '_ {
+        let first = self
+            .blocks
+            .partition_point(|b| b.logical + u64::from(b.len) <= off);
+        let last = self.blocks.partition_point(|b| b.logical < off + len);
+        self.blocks[first..last.max(first)]
+            .iter()
+            .map(|b| b.stored_at..b.stored_at + u64::from(b.stored_len))
     }
 
     /// Blocks stored whole and raw (the stored-Kraken diagnostic stores every block so).
@@ -322,6 +426,7 @@ impl Kraken {
             even_lz: b.even_lz,
             odd_lz: b.odd_lz,
             mode_bits: b.mode_bits,
+            shuffle: b.shuffle,
         };
         // The stored bytes passed their outer digest, so a block that does not decode uses a
         // mode this decoder does not handle rather than being damaged.
@@ -360,5 +465,28 @@ impl Kraken {
             slot
         };
         &self.cache[slot].1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(files: u64, ublocks: u64) -> u64 {
+        (files - 1) | COMP_KRAKEN << 24 | ublocks << 32
+    }
+
+    #[test]
+    fn open_cost_admits_real_titles_and_refuses_what_the_fields_allow() {
+        // FF VII Rebirth's 34,188,936-byte descriptor, at a guess of ~160 GB of mount in
+        // ~640 K files (the counts its size implies), and a 1 TiB mount of few files.
+        assert!(open_cost(true, 34_188_936, header(640_000, 610_000), 0) <= MAX_OPEN);
+        assert!(open_cost(true, 10 << 20, header(1_000, 2_400_000), 0) <= MAX_OPEN);
+        assert!(open_cost(true, 64 << 20, header(1_000, 4_200_000), 0) > MAX_OPEN);
+        assert!(open_cost(true, 1 << 20, header(1 << 24, 0xFF_FFFF), 0) > MAX_OPEN);
+        assert!(open_cost(false, u64::MAX, 0, 0) > MAX_OPEN);
+        assert!(open_cost(false, 64 << 20, 0xFF_FFFF << 32, u64::MAX) > MAX_OPEN);
+        // What `MAX_OPEN`'s note says a kept block costs, its shuffle id included.
+        assert_eq!(std::mem::size_of::<KBlock>(), 32);
     }
 }

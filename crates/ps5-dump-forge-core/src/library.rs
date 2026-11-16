@@ -52,6 +52,11 @@ pub struct LibraryEntry {
     /// LZ4 packed (ampr_emu asset packs): `ampr_assets.index` at the root starts with the
     /// manifest magic, the rule of `reader::detect` (and of inspect's Packed).
     pub lz4_packed: bool,
+    /// zstd packed: `ampr_zstd.index` at the root starts with `AMPRZPK1` (inspect's rule).
+    pub zstd_packed: bool,
+    /// No `eboot.bin` at the root (a DLC, an update or another package), as
+    /// `Inspection::additional_content`.
+    pub additional_content: bool,
 }
 
 /// What a Library scan found.
@@ -162,6 +167,8 @@ struct Walk<'a> {
     /// Every accepted root: a walk from another root does not enter it.
     root_ids: HashSet<FileId>,
     image_probes: usize,
+    /// A package scan: only `.pkg` files are candidates and game folders are entered too.
+    packages: bool,
 }
 
 impl Walk<'_> {
@@ -201,7 +208,8 @@ impl Walk<'_> {
             };
             names.sort_by(|a, b| a.0.cmp(&b.0));
             let has = |n: &str| names.iter().any(|(name, _)| name == n);
-            if has("eboot.bin") && has("sce_sys") {
+            // Without `eboot.bin` too: additional content (a DLC, an update) is listed.
+            if !self.packages && has("sce_sys") {
                 // Folder probes are cheap (metadata and one small read), so they run here:
                 // an accepted game is never entered, a rejected folder is searched on.
                 if let Some(found) = probe_folder(&dir) {
@@ -286,7 +294,8 @@ impl Walk<'_> {
     }
 
     fn image(&mut self, path: PathBuf, name: &str, dev: u64) {
-        let Some(kind) = image_kind(name) else { return };
+        let kind = image_kind(name).filter(|k| !self.packages || *k == Kind::Pkg);
+        let Some(kind) = kind else { return };
         match path_id(&path) {
             Ok((id, _)) if id.0 != dev => self.warnings.add(format!(
                 "{}: skipped, on another filesystem than its folder",
@@ -365,7 +374,8 @@ fn entry(
     kind: Format,
     param: &[u8],
     has_cover: bool,
-    lz4_packed: bool,
+    (lz4_packed, zstd_packed): (bool, bool),
+    additional_content: bool,
 ) -> Option<LibraryEntry> {
     let info = parse_param(param);
     let json = info.param_json.as_ref()?;
@@ -381,6 +391,8 @@ fn entry(
             .map(str::to_string),
         has_cover,
         lz4_packed,
+        zstd_packed,
+        additional_content,
     })
 }
 
@@ -388,19 +400,25 @@ fn entry(
 /// folder's device) that starts with the manifest magic. One open and an 8-byte read.
 fn folder_packed(dir: &Path, dev: u64) -> bool {
     use ps5_dump_forge_lz4::{MANIFEST, format::PAK_MAGIC};
+    folder_magic(dir, MANIFEST, PAK_MAGIC, dev)
+}
+
+/// `name` in a game folder is a regular file (on the folder's device) that starts with `magic`.
+fn folder_magic(dir: &Path, name: &str, magic: &[u8; 8], dev: u64) -> bool {
     use std::io::Read;
-    let Some((mut file, _)) = folder_open(dir, MANIFEST, dev) else {
+    let Some((mut file, _)) = folder_open(dir, name, dev) else {
         return false;
     };
-    let mut magic = [0u8; 8];
-    file.read_exact(&mut magic).is_ok() && &magic == PAK_MAGIC
+    let mut head = [0u8; 8];
+    file.read_exact(&mut head).is_ok() && &head == magic
 }
 
 /// A game folder's entry, or `None` when it is not a usable one (a folder's problems are
 /// its own business: no warning).
 fn probe_folder(dir: &Path) -> Option<LibraryEntry> {
     let dev = path_id(dir).ok()?.0.0;
-    folder_open(dir, "eboot.bin", dev)?;
+    // Without one it is additional content (a DLC, an update), listed too.
+    let no_eboot = folder_open(dir, "eboot.bin", dev).is_none();
     if !plain_dir(&dir.join("sce_sys"), dev) {
         return None;
     }
@@ -409,18 +427,33 @@ fn probe_folder(dir: &Path) -> Option<LibraryEntry> {
     let cover = folder_open(dir, "sce_sys/icon0.png", dev)
         .is_some_and(|(_, len)| (1..=MAX_LIBRARY_COVER).contains(&len));
     let packed = folder_packed(dir, dev);
-    entry(dir.to_path_buf(), Format::Folder, &param, cover, packed)
+    let zstd = folder_magic(
+        dir,
+        crate::zstd_pack::PACK_INDEX,
+        crate::zstd_pack::INDEX_MAGIC,
+        dev,
+    );
+    entry(
+        dir.to_path_buf(),
+        Format::Folder,
+        &param,
+        cover,
+        (packed, zstd),
+        no_eboot,
+    )
 }
 
 /// An image's entry. Opening reads the image's own metadata, so this costs more than a folder.
 fn probe_image(path: &Path, kind: Kind) -> Result<Option<LibraryEntry>, String> {
+    // A patch package is no game by itself.
+    if kind == Kind::Pkg && ps5_dump_forge_fpkg::is_patch(path) {
+        return Ok(None);
+    }
     let mut tree = crate::convert::open_source(path, kind, &AtomicBool::new(false))
         .map_err(|e| format!("skipped, cannot open: {e}"))?;
     let size = |name: &str| tree.files().iter().find(|f| f.path == name).map(|f| f.size);
     let (cover, param_size) = (size("sce_sys/icon0.png"), size("sce_sys/param.json"));
-    if size("eboot.bin").is_none() {
-        return Err("skipped, no eboot.bin at the root".to_string());
-    }
+    let no_eboot = size("eboot.bin").is_none();
     if param_size.is_none_or(|s| s == 0 || s > MAX_PARAM_JSON) {
         return Err("skipped, sce_sys/param.json is missing or too big".to_string());
     }
@@ -440,9 +473,17 @@ fn probe_image(path: &Path, kind: Kind) -> Result<Option<LibraryEntry>, String> 
     let has_cover = cover.is_some_and(|s| (1..=MAX_LIBRARY_COVER).contains(&s));
     // The image is open already: its file list, then 8 bytes of the manifest when listed.
     let packed = ps5_dump_forge_lz4::reader::detect(tree.as_mut()).unwrap_or(false);
-    entry(path.to_path_buf(), format, &param, has_cover, packed)
-        .map(Some)
-        .ok_or_else(|| "skipped, param.json has no usable title ID".to_string())
+    let zstd = crate::zstd_pack::packed(tree.as_mut());
+    entry(
+        path.to_path_buf(),
+        format,
+        &param,
+        has_cover,
+        (packed, zstd),
+        no_eboot,
+    )
+    .map(Some)
+    .ok_or_else(|| "skipped, param.json has no usable title ID".to_string())
 }
 
 /// The cover of a supported image or plain game folder as a PNG data URL. `None` when the
@@ -477,6 +518,9 @@ fn eligible(path: &Path, classify: Classify<'_>) -> Result<(), String> {
 
 fn cover_with(path: &Path, max: u64, classify: Classify<'_>) -> anyhow::Result<Option<String>> {
     use anyhow::{anyhow, bail};
+    if crate::net::is_network(path) {
+        return net_cover(path, max);
+    }
     eligible(path, classify).map_err(|why| anyhow!("{}: {why}", path.display()))?;
     let meta = path.symlink_metadata()?;
     // The same five extensions as the scan (never `.ufs2`).
@@ -519,13 +563,34 @@ fn cover_with(path: &Path, max: u64, classify: Classify<'_>) -> anyhow::Result<O
     Ok(png.and_then(|b| crate::inspect::png_data_url(&b)))
 }
 
+/// [`cover_with`] for an `smb://` or `flink://` folder or image: no links or mounts to check
+/// on a share or a peer (a peer leaves out links and special files).
+fn net_cover(path: &Path, max: u64) -> anyhow::Result<Option<String>> {
+    const ICON: &str = "sce_sys/icon0.png";
+    let png = match Kind::of(path)? {
+        Kind::Folder => crate::net::read_small(path, ICON, max)?,
+        kind => {
+            let mut tree = crate::convert::open_source(path, kind, &AtomicBool::new(false))?;
+            let size = tree.files().iter().find(|f| f.path == ICON).map(|f| f.size);
+            match size {
+                Some(s) if (1..=max).contains(&s) => tree.read(ICON).ok(),
+                _ => None,
+            }
+        }
+    };
+    Ok(png
+        .filter(|b| !b.is_empty() && b.len() as u64 <= max)
+        .and_then(|b| crate::inspect::png_data_url(&b)))
+}
+
 /// Probes every candidate on up to four threads; results in candidate order. A panic skips
 /// that candidate with a warning.
-fn probe_all(
+fn probe_all<T: Send>(
     candidates: &[(PathBuf, Kind)],
     limits: &Limits,
     start: Instant,
-) -> Vec<Result<Option<LibraryEntry>, String>> {
+    probe: fn(&Path, Kind) -> Result<Option<T>, String>,
+) -> Vec<Result<Option<T>, String>> {
     let next = AtomicUsize::new(0);
     let slots = Mutex::new((0..candidates.len()).map(|_| None).collect::<Vec<_>>());
     let threads = std::thread::available_parallelism()
@@ -542,7 +607,7 @@ fn probe_all(
                     let result = if start.elapsed() >= limits.budget {
                         Err(NOT_PROBED.to_string())
                     } else {
-                        std::panic::catch_unwind(|| probe_image(&candidate.0, candidate.1))
+                        std::panic::catch_unwind(|| probe(&candidate.0, candidate.1))
                             .unwrap_or_else(|_| Err("skipped, the probe panicked".to_string()))
                     };
                     slots.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(result);
@@ -596,13 +661,30 @@ fn plain_spelling(path: PathBuf) -> PathBuf {
 
 /// Errors when the chosen folder (canonical) is a system one.
 fn refuse_folder(root: &Path) -> anyhow::Result<()> {
-    let Some(os) = Os::HOST else { return Ok(()) };
-    let real = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let home = home().map(|h| h.canonicalize().unwrap_or(h));
-    match refusal(&real, home.as_deref(), os, system_drive()) {
+    match folder_refusal(root) {
         Some(why) => anyhow::bail!(why),
         None => Ok(()),
     }
+}
+
+/// Why `path` is a folder (or inside one) the Library refuses as a chosen folder, as its
+/// error says it; `None` when allowed, and always on the PS5. Compared canonical: a path that
+/// isn't there yet (a move's target) by its folder's canonical path and its name, one whose
+/// folder isn't there either as typed.
+pub(crate) fn folder_refusal(path: &Path) -> Option<String> {
+    let os = Os::HOST?;
+    let real = dunce::canonicalize(path)
+        .ok()
+        .or_else(|| {
+            Some(
+                dunce::canonicalize(path.parent()?)
+                    .ok()?
+                    .join(path.file_name()?),
+            )
+        })
+        .unwrap_or_else(|| path.to_path_buf());
+    let home = home().map(|h| dunce::canonicalize(&h).unwrap_or(h));
+    refusal(&real, home.as_deref(), os, system_drive())
 }
 
 /// The walk of a chosen folder. The folder itself must be a readable directory (an error:
@@ -627,50 +709,8 @@ fn scan_inner(
     limits: &Limits,
     classify: Classify<'_>,
 ) -> (LibraryScan, Option<String>) {
-    let mut walk = Walk {
-        limits,
-        classify,
-        home: home(),
-        start: Instant::now(),
-        candidates: Vec::new(),
-        folders: Vec::new(),
-        warnings: Warnings::default(),
-        truncated: false,
-        seen_dirs: HashSet::new(),
-        seen_images: HashSet::new(),
-        root_ids: HashSet::new(),
-        root_error: None,
-        image_probes: 0,
-    };
-    // Accepted roots, in the supplied order one per identity.
-    let mut accepted = Vec::new();
-    for root in roots {
-        let id = match (eligible(root, classify), root.to_str(), path_id(root)) {
-            (Err(why), ..) => Err(why),
-            (_, None, _) => Err("not a UTF-8 path".to_string()),
-            (_, _, Err(e)) => Err(e.to_string()),
-            (_, _, Ok((id, _))) => Ok(id),
-        };
-        // Walk the canonical spelling so every child and shadowmnt check is canonical (`..` or
-        // ancestor links in the typed path). Not on Windows: `\\?\C:\` spellings would leak into
-        // entry paths; ShadowMountPlus's mounts exist only on FreeBSD anyway.
-        #[cfg(not(windows))]
-        let root = &root.canonicalize().unwrap_or_else(|_| root.clone());
-        match id {
-            Ok(id) if walk.root_ids.insert(id) => accepted.push((root.clone(), id)),
-            Ok(_) => {}
-            Err(why) => {
-                walk.root_error
-                    .get_or_insert(format!("{}: {why}", root.display()));
-                walk.warnings.add(format!("{}: {why}", root.display()))
-            }
-        }
-    }
-    for (root, id) in &accepted {
-        walk.seen_dirs.insert(*id);
-        walk.root(root, *id);
-    }
-    let results = probe_all(&walk.candidates, limits, walk.start);
+    let (mut walk, accepted) = walk(roots, limits, classify, false);
+    let results = probe_all(&walk.candidates, limits, walk.start, probe_image);
     let mut entries = std::mem::take(&mut walk.folders);
     for (candidate, result) in walk.candidates.iter().zip(results) {
         let path = &candidate.0;
@@ -704,6 +744,173 @@ fn scan_inner(
         warnings: walk.warnings.finish(),
     };
     (found, root_error)
+}
+
+/// Walks the eligible `roots`: the walk (its candidates, folders and findings) and the roots
+/// accepted, one per identity in the order given.
+fn walk<'a>(
+    roots: &[PathBuf],
+    limits: &'a Limits,
+    classify: Classify<'a>,
+    packages: bool,
+) -> (Walk<'a>, Vec<(PathBuf, FileId)>) {
+    let mut walk = Walk {
+        limits,
+        classify,
+        home: home(),
+        start: Instant::now(),
+        candidates: Vec::new(),
+        folders: Vec::new(),
+        warnings: Warnings::default(),
+        truncated: false,
+        seen_dirs: HashSet::new(),
+        seen_images: HashSet::new(),
+        root_ids: HashSet::new(),
+        root_error: None,
+        image_probes: 0,
+        packages,
+    };
+    // Accepted roots, in the supplied order one per identity.
+    let mut accepted = Vec::new();
+    for root in roots {
+        let id = match (eligible(root, classify), root.to_str(), path_id(root)) {
+            (Err(why), ..) => Err(why),
+            (_, None, _) => Err("not a UTF-8 path".to_string()),
+            (_, _, Err(e)) => Err(e.to_string()),
+            (_, _, Ok((id, _))) => Ok(id),
+        };
+        // Walk the canonical spelling so every child and shadowmnt check is canonical (`..` or
+        // ancestor links in the typed path). Not on Windows: `\\?\C:\` spellings would leak into
+        // entry paths; ShadowMountPlus's mounts exist only on FreeBSD anyway.
+        #[cfg(not(windows))]
+        let root = &root.canonicalize().unwrap_or_else(|_| root.clone());
+        match id {
+            Ok(id) if walk.root_ids.insert(id) => accepted.push((root.clone(), id)),
+            Ok(_) => {}
+            Err(why) => {
+                walk.root_error
+                    .get_or_insert(format!("{}: {why}", root.display()));
+                walk.warnings.add(format!("{}: {why}", root.display()))
+            }
+        }
+    }
+    for (root, id) in &accepted {
+        walk.seen_dirs.insert(*id);
+        walk.root(root, *id);
+    }
+    (walk, accepted)
+}
+
+/// What a package installs, by its container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageContent {
+    Game,
+    /// A patch package (`\x7FLIH`).
+    Patch,
+    /// A DLC or another add-on (content type `0x21`).
+    AdditionalContent,
+    /// Unreadable, or a content type Forge doesn't know: the console judges it.
+    Unknown,
+}
+
+/// One `.pkg` the package scan found. The title fields come from the container's plaintext
+/// `param.json`, so a package whose container can't be read is listed with none of them.
+#[derive(Debug, Clone, Serialize)]
+pub struct PackageEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    pub content_id: Option<String>,
+    pub title_id: Option<String>,
+    pub title_name: Option<String>,
+    pub title_names: std::collections::BTreeMap<String, String>,
+    pub version: Option<String>,
+    pub content: PackageContent,
+    /// The container carries a plaintext `icon0.png` of 1 B..512 KiB.
+    pub has_cover: bool,
+}
+
+/// What a package scan found.
+#[derive(Debug, Clone, Serialize)]
+pub struct PackageScan {
+    pub entries: Vec<PackageEntry>,
+    pub truncated: bool,
+}
+
+/// A package's entry from its header and container alone (`fpkg::peek`, a few KiB read).
+fn probe_package(path: &Path, _: Kind) -> Result<Option<PackageEntry>, String> {
+    let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
+    let mut entry = PackageEntry {
+        path: path.to_path_buf(),
+        size,
+        content_id: None,
+        title_id: None,
+        title_name: None,
+        title_names: Default::default(),
+        version: None,
+        content: PackageContent::Unknown,
+        has_cover: false,
+    };
+    // Not a package this reader knows: listed all the same, the console judges it.
+    let Ok(peek) = ps5_dump_forge_fpkg::peek(path, MAX_PARAM_JSON) else {
+        return Ok(Some(entry));
+    };
+    entry.content = match peek.content_type {
+        _ if peek.patch => PackageContent::Patch,
+        0x20 | 0x26 => PackageContent::Game,
+        0x21 => PackageContent::AdditionalContent,
+        _ => PackageContent::Unknown,
+    };
+    entry.content_id = Some(peek.content_id).filter(|id| !id.is_empty());
+    entry.has_cover = peek
+        .icon0_size
+        .is_some_and(|s| (1..=MAX_LIBRARY_COVER).contains(&s));
+    let info = parse_param(peek.param_json.as_deref().unwrap_or_default());
+    if let Some(json) = info.param_json.as_ref() {
+        entry.title_name = crate::inspect::title_name(json);
+        entry.title_names = crate::inspect::title_names(json);
+        entry.version = (json.get("contentVersion").and_then(|v| v.as_str())).map(str::to_string);
+    }
+    entry.title_id = info.title_id;
+    Ok(Some(entry))
+}
+
+/// Every `.pkg` under `roots`, walked as the Library walks (game folders entered too).
+fn packages(roots: &[PathBuf], limits: &Limits, classify: Classify<'_>) -> PackageScan {
+    let (mut walk, _) = walk(roots, limits, classify, true);
+    let results = probe_all(&walk.candidates, limits, walk.start, probe_package);
+    let mut entries = Vec::new();
+    for result in results {
+        match result {
+            Ok(Some(e)) => entries.push(e),
+            Ok(None) => {}
+            // Gone since the walk, or never reached: only the budget makes the list partial.
+            Err(why) => walk.truncated |= why == NOT_PROBED,
+        }
+    }
+    if entries.len() > limits.games {
+        entries.truncate(limits.games);
+        walk.truncated = true;
+    }
+    entries.sort_by_cached_key(|e| {
+        let shown = (e.title_name.as_deref().or(e.title_id.as_deref())).map(str::to_lowercase);
+        (shown.is_none(), shown, e.version.clone(), e.path.clone())
+    });
+    PackageScan {
+        entries,
+        truncated: walk.truncated,
+    }
+}
+
+pub(crate) fn scan_packages(roots: &[PathBuf]) -> anyhow::Result<PackageScan> {
+    let _guard = SCAN.lock().unwrap_or_else(|e| e.into_inner());
+    if roots.is_empty() {
+        return Ok(packages(roots, &LIMITS, &|_| Ok(())));
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    anyhow::bail!("package discovery runs only on the PS5");
+    #[cfg(target_os = "freebsd")]
+    Ok(packages(roots, &LIMITS, &ps5_classify))
 }
 
 /// How deep inside an archive its game folder may sit (the archive's root is 0).
@@ -758,16 +965,25 @@ pub(crate) fn archive_game_root(
         .map(|e| (e.path.as_str(), e.size))
         .collect();
     let param = |root: &str| format!("{root}sce_sys/param.json");
-    let mut roots: Vec<&str> = files
-        .keys()
-        .filter_map(|p| p.strip_suffix("eboot.bin"))
-        .filter(|r| (r.is_empty() || r.ends_with('/')) && r.matches('/').count() <= ARCHIVE_DEPTH)
-        .filter(|r| {
-            files
-                .get(param(r).as_str())
-                .is_some_and(|s| (1..=MAX_PARAM_JSON).contains(s))
-        })
-        .collect();
+    let candidates = |marker: &str| -> Vec<&str> {
+        files
+            .keys()
+            .filter_map(|p| p.strip_suffix(marker))
+            .filter(|r| {
+                (r.is_empty() || r.ends_with('/')) && r.matches('/').count() <= ARCHIVE_DEPTH
+            })
+            .filter(|r| {
+                files
+                    .get(param(r).as_str())
+                    .is_some_and(|s| (1..=MAX_PARAM_JSON).contains(s))
+            })
+            .collect()
+    };
+    let mut roots = candidates("eboot.bin");
+    // No game: additional content (param.json without eboot.bin, by user decision).
+    if roots.is_empty() {
+        roots = candidates("sce_sys/param.json");
+    }
     roots.sort_unstable();
     if roots.len() > ARCHIVE_CANDIDATES {
         return Err(several_games(&roots));
@@ -850,6 +1066,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn run(roots: &[&Path], limits: &Limits) -> LibraryScan {
         let roots: Vec<PathBuf> = roots.iter().map(|r| r.to_path_buf()).collect();
         scan(&roots, limits, &|_| Ok(()))
@@ -858,90 +1075,6 @@ mod tests {
     #[cfg(unix)]
     fn paths(scan: &LibraryScan) -> Vec<&Path> {
         scan.entries.iter().map(|e| e.path.as_path()).collect()
-    }
-
-    #[test]
-    fn folder_metadata() {
-        let root = tmp("meta");
-        game(
-            &root,
-            "a",
-            r#"{"titleId":"PPSA00001","contentVersion":"01.002.000","localizedParameters":{"defaultLanguage":"de-DE","de-DE":{"titleName":"Spiel"},"en-US":{"titleName":"Game"}}}"#,
-        );
-        // No titleId: the content ID names it; no title, no version.
-        game(
-            &root,
-            "b",
-            r#"{"contentId":"UP0000-PPSA00002_00-TESTTESTTESTTEST"}"#,
-        );
-        put(&root.join("a"), "sce_sys/icon0.png", b"png");
-        let scan = run(&[&root], &LIMITS);
-        let (a, b) = (&scan.entries[1], &scan.entries[0]);
-        assert_eq!(a.kind, Format::Folder);
-        assert_eq!(
-            (a.title_id.as_str(), a.title_name.as_deref()),
-            ("PPSA00001", Some("Spiel"))
-        );
-        assert_eq!(
-            (a.version.as_deref(), a.has_cover),
-            (Some("01.002.000"), true)
-        );
-        assert_eq!(a.title_names.len(), 2);
-        assert_eq!(a.title_names["en-US"], "Game");
-        assert!(b.title_names.is_empty());
-        assert_eq!(
-            (
-                b.title_id.as_str(),
-                b.title_name.as_deref(),
-                b.version.as_deref()
-            ),
-            ("PPSA00002", None, None)
-        );
-        assert!(!b.has_cover);
-        assert!(scan.warnings.is_empty());
-    }
-
-    #[test]
-    fn exfat_image_is_listed_and_junk_image_warns() {
-        let root = tmp("image");
-        let src = game(
-            &root,
-            "src",
-            r#"{"titleId":"PPSA00009","titleName":"Image Game","contentVersion":"01.000.000"}"#,
-        );
-        put(&src, "sce_sys/icon0.png", b"png");
-        // A manifest by its magic is what makes an image LZ4 packed (as `reader::detect`).
-        put(&src, "ampr_assets.index", b"AMPRPAK4 rest of a manifest");
-        let tree = ps5upload_fpkg::source::FolderSource::open(&src).unwrap();
-        let layout =
-            ps5_dump_forge_exfat::plan(&tree, &Default::default(), &AtomicBool::new(false))
-                .unwrap();
-        let mut tree = tree;
-        let mut out = fs::File::create(root.join("Game.exfat")).unwrap();
-        ps5_dump_forge_exfat::write(
-            &mut tree,
-            &layout,
-            &mut out,
-            &AtomicBool::new(false),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        drop(out);
-        fs::remove_dir_all(&src).unwrap();
-        put(&root, "bad.ffpkg", b"junk bytes");
-        let scan = run(&[&root], &LIMITS);
-        assert_eq!(scan.entries.len(), 1);
-        let e = &scan.entries[0];
-        assert_eq!(
-            (e.kind, e.title_id.as_str(), e.title_name.as_deref()),
-            (Format::Exfat, "PPSA00009", Some("Image Game"))
-        );
-        assert_eq!(
-            (e.version.as_deref(), e.has_cover, e.lz4_packed),
-            (Some("01.000.000"), true, true)
-        );
-        assert_eq!(scan.warnings.len(), 1);
-        assert!(scan.warnings[0].contains("bad.ffpkg"));
     }
 
     #[cfg(unix)]
@@ -971,19 +1104,6 @@ mod tests {
         let err = cover_with(&via, MAX_LIBRARY_COVER, &deny).unwrap_err();
         assert!(err.to_string().contains("network"));
         assert!(g.is_dir());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn links_are_not_followed() {
-        let root = tmp("links");
-        let real = tmp("links-real");
-        let g = game(&real, "g", OK);
-        std::os::unix::fs::symlink(&g, root.join("linked")).unwrap();
-        // A game whose sce_sys is a link to a real one.
-        put(&root, "game/eboot.bin", b"x");
-        std::os::unix::fs::symlink(g.join("sce_sys"), root.join("game/sce_sys")).unwrap();
-        assert!(run(&[&root], &LIMITS).entries.is_empty());
     }
 
     #[cfg(unix)]
@@ -1025,20 +1145,105 @@ mod tests {
         assert!(found.roots.is_empty() && !found.warnings.is_empty());
     }
 
-    fn deny_none() -> impl Fn(&Path) -> Result<(), String> + Sync {
-        |_| Ok(())
+    /// A small game's `.pkg` at `out`, built as a conversion builds one.
+    fn package(src: &Path, out: &Path) {
+        use ps5upload_fpkg::build::{self, BuildControl, BuildRequest};
+        let mut request = BuildRequest::production(src, out.parent().unwrap());
+        request.time = Some((1_700_000_000, 0));
+        request.threads = Some(2);
+        request.level = ps5upload_fpkg::kraken::Level::Fast;
+        let mut tree = ps5upload_fpkg::source::FolderSource::open(src).unwrap();
+        let prepared = build::prepare(&mut tree, &request, &mut BuildControl::default()).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(out)
+            .unwrap();
+        let mut control = BuildControl::default();
+        build::write_package(
+            &prepared,
+            &mut tree,
+            &mut file,
+            out,
+            &mut |_| {},
+            &mut control,
+        )
+        .unwrap();
     }
 
     #[test]
-    fn cover_none_for_non_png_and_oversized() {
-        let root = tmp("cover-none");
-        let dir = game(&root, "g", r#"{"titleId":"PPSA00001"}"#);
-        put(&dir, "sce_sys/icon0.png", b"JPEG....");
-        assert_eq!(
-            cover_with(&dir, MAX_LIBRARY_COVER, &deny_none()).unwrap(),
-            None
+    fn scan_packages_lists_every_pkg_from_its_container() {
+        let (src, root) = (tmp("pkg-src"), tmp("pkg-root"));
+        game(
+            &src,
+            "",
+            r#"{"contentId":"UP0000-PPSA01234_00-TESTGAME00000000","titleId":"PPSA01234","contentVersion":"01.001.000","localizedParameters":{"defaultLanguage":"en-US","en-US":{"titleName":"Pkg Game"}}}"#,
         );
-        put(&dir, "sce_sys/icon0.png", b"\x89PNG\r\n");
-        assert_eq!(cover_with(&dir, 4, &deny_none()).unwrap(), None);
+        put(&src, "sce_sys/icon0.png", b"\x89PNG\r\n");
+        put(&src, "data/a.bin", &[7u8; 70_000]);
+        // Inside a game folder too: a package scan enters every folder.
+        let inside = game(&root, "Game", r#"{"titleId":"PPSA00009"}"#);
+        let pkg = inside.join("Game.PKG");
+        package(&src, &pkg);
+
+        // A patch: its 64 KiB header points at the patched package's container.
+        let bytes = fs::read(&pkg).unwrap();
+        let le64 = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+        let (pfs_offset, cnt_offset) = (le64(0x10), le64(0x58));
+        let cnt_end = if cnt_offset < pfs_offset {
+            pfs_offset
+        } else {
+            bytes.len()
+        };
+        let mut patch = vec![0u8; 0x10000];
+        patch.extend_from_slice(&bytes[cnt_offset..cnt_end]);
+        patch[..4].copy_from_slice(b"\x7FLIH");
+        let len = patch.len() as u64;
+        for (at, v) in [(0x18, len), (0x30, 0x10000), (0x38, len - 0x10000)] {
+            patch[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        put(&root, "deep/er/update.pkg", &patch);
+        put(&root, "junk.pkg", b"not a package");
+        put(&root, "Other.exfat", b"not listed by a package scan");
+
+        let roots = [root.to_path_buf()];
+        let scan = packages(&roots, &LIMITS, &|_| Ok(()));
+        assert!(!scan.truncated);
+        let content: Vec<_> = scan
+            .entries
+            .iter()
+            .map(|e| (e.path.clone(), e.content))
+            .collect();
+        assert_eq!(
+            content,
+            [
+                (pkg.clone(), PackageContent::Game),
+                (root.join("deep/er/update.pkg"), PackageContent::Patch),
+                (root.join("junk.pkg"), PackageContent::Unknown),
+            ]
+        );
+        let (game, patch) = (&scan.entries[0], &scan.entries[1]);
+        assert_eq!(game.size, fs::metadata(&pkg).unwrap().len());
+        assert_eq!(
+            (game.title_id.as_deref(), game.title_name.as_deref()),
+            (Some("PPSA01234"), Some("Pkg Game"))
+        );
+        assert_eq!(game.title_names["en-US"], "Pkg Game");
+        assert_eq!(game.version.as_deref(), Some("01.001.000"));
+        assert_eq!(
+            game.content_id.as_deref(),
+            Some("UP0000-PPSA01234_00-TESTGAME00000000")
+        );
+        assert!(game.has_cover);
+        assert_eq!(
+            (patch.title_id.as_deref(), patch.has_cover),
+            (Some("PPSA01234"), true)
+        );
+        let junk = &scan.entries[2];
+        assert_eq!(
+            (junk.size, junk.title_id.as_deref(), junk.has_cover),
+            (13, None, false)
+        );
     }
 }

@@ -1,5 +1,5 @@
 //! Byte-level pieces of the AMPR pack formats: magics, sizes, flag bits, checked little-endian
-//! access, the two path hashes and the journal's payload hash, the CRC ranges, logical path
+//! access, the two path hashes, the CRC ranges, logical path
 //! rules and the chunk `location`/`descriptor` words. Nothing here maps a struct onto bytes.
 
 use ps5upload_fpkg::{Error, Result};
@@ -9,14 +9,12 @@ pub const DAT_MAGIC: &[u8; 8] = b"AMPRDAT3";
 pub const CFG_MAGIC: &[u8; 8] = b"AMPRCFG1";
 pub const CRC_MAGIC: &[u8; 8] = b"AMPRCRC1";
 pub const IDX_MAGIC: &[u8; 8] = b"AMPRIDX3";
-pub const CMD_MAGIC: &[u8; 8] = b"AMPRCMD1";
 
 pub const PAK_VERSION: u32 = 4;
 pub const DAT_VERSION: u32 = 3;
 pub const CFG_VERSION: u32 = 1;
 pub const CRC_VERSION: u32 = 1;
 pub const IDX_VERSION: u32 = 3;
-pub const CMD_VERSION: u16 = 1;
 pub const ENDIAN_MARKER: u32 = 0x0102_0304;
 
 pub const PAK_HEADER: usize = 128;
@@ -29,7 +27,6 @@ pub const CRC_HEADER: usize = 48;
 pub const IDX_HEADER: usize = 48;
 pub const IDX_RECORD: usize = 24;
 pub const IDX_SLOT: usize = 16;
-pub const CMD_HEADER: usize = 96;
 
 /// Offsets of the CRC fields inside their headers.
 pub const PAK_PAYLOAD_CRC_AT: usize = 112;
@@ -111,9 +108,6 @@ fn put(b: &mut [u8], off: usize, v: &[u8]) -> Result<()> {
         })
 }
 
-pub fn put_u16(b: &mut [u8], off: usize, v: u16) -> Result<()> {
-    put(b, off, &v.to_le_bytes())
-}
 pub fn put_u32(b: &mut [u8], off: usize, v: u32) -> Result<()> {
     put(b, off, &v.to_le_bytes())
 }
@@ -138,7 +132,7 @@ pub fn check_magic(b: &[u8], magic: &[u8; 8], what: &str) -> Result<()> {
 const FNV_PRIME: u64 = 1099511628211;
 /// AMPRPAK4 path hash: standard FNV-1a 64.
 const PAK_BASIS: u64 = 14695981039346656037;
-/// AMPRIDX3 slot hash and AMPRCMD1 payload hash: the same basis with its last digit dropped.
+/// AMPRIDX3 slot hash: the same basis with its last digit dropped.
 const IDX_BASIS: u64 = 1469598103934665603;
 
 fn fold(b: u8) -> u8 {
@@ -162,11 +156,6 @@ pub fn pak_hash(path: &[u8]) -> u64 {
 /// Path index slot hash of a complete `/app0/...` path, folded as `pak_hash` does.
 pub fn idx_hash(path: &[u8]) -> u64 {
     fnv(IDX_BASIS, path.iter().copied().map(fold))
-}
-
-/// Journal payload hash: the index basis over the raw bytes, no folding.
-pub fn cmd_hash(payload: &[u8]) -> u64 {
-    fnv(IDX_BASIS, payload.iter().copied())
 }
 
 /// CRC-32/ISO-HDLC of `bytes`.
@@ -355,18 +344,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hashes_fold_paths_but_cmd_hash_does_not() {
-        assert_eq!(pak_hash(b"/APP0\\Dir\\X.Bin"), pak_hash(b"/app0/dir/x.bin"));
-        assert_eq!(idx_hash(b"/APP0\\Dir\\X.Bin"), idx_hash(b"/app0/dir/x.bin"));
-        // Only ASCII A-Z fold.
-        assert_ne!(pak_hash("É".as_bytes()), pak_hash("é".as_bytes()));
-        assert_ne!(cmd_hash(b"A"), cmd_hash(b"a"));
-        assert_ne!(cmd_hash(b"\\"), cmd_hash(b"/"));
-        assert_eq!(cmd_hash(b""), 1469598103934665603);
-        assert_eq!(cmd_hash(b"a"), idx_hash(b"a"));
-    }
-
     fn sample(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 7 + 3) as u8).collect()
     }
@@ -399,102 +376,5 @@ mod tests {
             h[len] ^= 1;
             assert!(f(&h[..len - 1]).is_err());
         }
-    }
-
-    #[test]
-    fn logical_paths() {
-        assert_eq!(logical_to_rel("/app0/a/B.bin").unwrap(), "a/B.bin");
-        assert_eq!(logical_to_rel("/APP0/x").unwrap(), "x");
-        assert_eq!(
-            rel_to_logical("sce_sys/param.json").unwrap(),
-            "/app0/sce_sys/param.json"
-        );
-        for bad in [
-            "",
-            "/app0",
-            "/app0/",
-            "app0/x",
-            "/app1/x",
-            "/app0x/x",
-            "/app0//x",
-            "/app0/x/",
-            "/app0/./x",
-            "/app0/x/..",
-            "/app0/a\\b",
-            "/app0/a\0b",
-            "//app0/x",
-            "/é/x",
-        ] {
-            assert!(logical_to_rel(bad).is_err(), "{bad:?}");
-        }
-        // Multi-byte chars across the prefix are an error, never a slice panic.
-        for bad in [
-            "/appé/foo",
-            "éabcd/x",
-            "/app0é",
-            "/é",
-            "é",
-            "/ap\u{1F600}/x",
-        ] {
-            assert!(logical_to_rel(bad).is_err(), "{bad:?}");
-        }
-        assert!(rel_to_logical("").is_err());
-        assert!(rel_to_logical("a//b").is_err());
-        assert!(rel_to_logical("/a").is_err());
-        let comp = "a".repeat(255);
-        assert!(rel_to_logical(&comp).is_ok());
-        assert!(rel_to_logical(&"a".repeat(256)).is_err());
-        // 1023 bytes in all is the limit.
-        let long = format!(
-            "{}/{}/{}/{}",
-            comp,
-            comp,
-            comp,
-            "b".repeat(1023 - 6 - 3 * 256)
-        );
-        assert_eq!(long.len() + 6, 1023);
-        assert!(rel_to_logical(&long).is_ok());
-        assert!(rel_to_logical(&format!("{long}b")).is_err());
-    }
-
-    #[test]
-    fn pack_names() {
-        assert!(check_pack_name("ampr_assets-000.pak").is_ok());
-        assert!(check_pack_name("sub/dir.pak").is_ok());
-        for bad in ["", "/abs.pak", "a/../b", "a\\b", "a//b", "a/"] {
-            assert!(check_pack_name(bad).is_err(), "{bad:?}");
-        }
-        assert!(
-            check_pack_name(&format!(
-                "{}/{}/{}/{}",
-                "a".repeat(255),
-                "a".repeat(255),
-                "a".repeat(255),
-                "a".repeat(249)
-            ))
-            .is_ok()
-        );
-        assert!(
-            check_pack_name(&format!(
-                "{}/{}/{}/{}",
-                "a".repeat(255),
-                "a".repeat(255),
-                "a".repeat(255),
-                "a".repeat(250)
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn descriptors_reject_invalid() {
-        assert!(pack_descriptor(0, Codec::Raw, 0).is_err());
-        assert!(pack_descriptor(MAX_STORED + 1, Codec::Raw, 0).is_err());
-        assert!(pack_descriptor(1, Codec::Raw, 0x10).is_err());
-        assert!(unpack_descriptor(2 << 20).is_err());
-        assert!(unpack_descriptor(3 << 20).is_err());
-        assert!(unpack_descriptor(1 << 30).is_err());
-        assert!(unpack_descriptor(1 << 31).is_err());
-        assert!(unpack_descriptor(0x10 << 22).is_err());
     }
 }

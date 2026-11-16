@@ -17,7 +17,8 @@
 #
 # Per volume (UFS, FAT, NULLFS), both optional:
 #   FREEBSD_BINS_<VOL>   test binaries to run, space separated: `lib` (core's unit tests),
-#                        `server-lib` (the server's), an integration test target name (`core`,
+#                        `server-lib` (the server's), `flink-lib` (FLINK's, the server's
+#                        protocol crate), an integration test target name (`core`,
 #                        `serve`, ...), or `all` (default for UFS and NULLFS; FAT defaults to
 #                        `lib freebsd_volumes`: tests/core.rs and the server's fixtures need
 #                        symlinks, hard links and FIFOs, which FAT32 cannot hold).
@@ -44,7 +45,7 @@ DIST=https://download.freebsd.org/releases/arm64/aarch64/$REL
 SYSROOT=freebsd-$REL-arm64-sysroot
 VM_TAG=ps5-dump-forge-ufs-vm
 BUILD_TAG=ps5-dump-forge-freebsd-build
-TOOLCHAIN=1.99.0
+TOOLCHAIN=1.100.0
 VOLUMES=${FREEBSD_VOLUMES:-ufs fat nullfs}
 TIMEOUT=${FREEBSD_TIMEOUT:-3600}
 
@@ -67,7 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 DOCKER
 
 docker build -q -t "$BUILD_TAG" - >/dev/null <<DOCKER
-FROM rust:1.99.0-slim-trixie@sha256:24e632c09342c20abf8312cf4f61430a911c01ed3a5e4c02b87292b1c39c5273
+FROM rust:1.100.0-slim-trixie@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a
 RUN apt-get update && apt-get install -y --no-install-recommends \
       clang-19 lld-19 llvm-19 jq xz-utils && rm -rf /var/lib/apt/lists/*
 RUN rustup target add --toolchain $TOOLCHAIN aarch64-unknown-freebsd && chmod -R a+rX "\$RUSTUP_HOME"
@@ -153,7 +154,7 @@ if [ ! -f "$SYSROOT/.done" ]; then
   tar -xJf "/cache/$REL-arm64-base.txz" -C "$SYSROOT" ./lib ./usr/lib ./usr/include
   chmod -R u+w "$SYSROOT" && touch "$SYSROOT/.done"
 fi
-export RUSTUP_TOOLCHAIN=1.99.0 RUSTUP_AUTO_INSTALL=0
+export RUSTUP_TOOLCHAIN=1.100.0 RUSTUP_AUTO_INSTALL=0
 export CARGO_HOME=/src/target/freebsd/cargo-home CARGO_TARGET_DIR=/forge
 t="--target=aarch64-unknown-freebsd14.4 --sysroot=$SYSROOT"
 export CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_LINKER=clang-19
@@ -161,7 +162,7 @@ export CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_RUSTFLAGS="-C link-arg=--target=aarc
 export CC_aarch64_unknown_freebsd=clang-19 CFLAGS_aarch64_unknown_freebsd="$t"
 export AR_aarch64_unknown_freebsd=llvm-ar-19
 cd /src
-cargo test --release --locked -p ps5-dump-forge-core -p ps5-dump-forge-server --no-run \
+cargo test --release --locked -p ps5-dump-forge-core -p ps5-dump-forge-server -p ps5-dump-forge-flink --no-run \
   --target aarch64-unknown-freebsd \
   --message-format=json-render-diagnostics >/tmp/build.json
 stage=/src/target/freebsd/stage
@@ -169,7 +170,11 @@ find "$stage" -type f ! -name run.sh ! -name config.sh -delete
 all=""
 while read -r kind name exe; do
   if [ "$kind" = lib ]; then
-    case $name in ps5_dump_forge_core) name=lib ;; *) name=server-lib ;; esac
+    case $name in
+      ps5_dump_forge_core) name=lib ;;
+      ps5_dump_forge_flink) name=flink-lib ;;
+      *) name=server-lib ;;
+    esac
   fi
   cp "$exe" "$stage/$name"; all="$all $name"
 done < <(jq -r 'select(.reason == "compiler-artifact" and .executable != null and .profile.test)

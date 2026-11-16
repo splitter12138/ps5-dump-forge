@@ -12,15 +12,20 @@ const FLAT = "与游戏大小相同";
 const zh: Messages = {
   // App.tsx
   app: {
-    address: (url) => `地址：${url}。查看连接方法和 QR 码`,
     screens: "页面",
     convert: "转换",
     active: (n) => `，${num(n)} 个进行中`,
-    inspect: "检查",
-    library: "游戏库",
+    edit: "编辑",
+    pack: "打包",
+    storage: "存储",
+    connect: "连接",
+    disconnected: "未连接",
+    connected: (n: number) => `已连接（${num(n)} 台设备）`,
     about: "关于",
+    prevTab: "上一个标签页 (L2)",
+    nextTab: "下一个标签页 (R2)",
     offline: "已离线，正在重试…",
-    stop: "停止 Dump Forge",
+    stop: "停止",
     stillRunning: (n) => (n === 1 ? "仍有一个任务在运行" : `仍有 ${num(n)} 个任务在运行`),
     job: (id) => `任务 ${id}`,
     quitNote: (web, n) =>
@@ -29,6 +34,7 @@ const zh: Messages = {
     stopAndQuit: (n) => (n === 1 ? "停止任务并退出" : "停止所有任务并退出"),
     stoppingJobs: "正在停止任务并清理…",
     stoppingForge: "正在停止 Dump Forge…",
+    quitting: "正在退出 PS5 Dump Forge…",
     couldntStop: "无法停止 Dump Forge",
     close: "关闭",
     tryAgain: "重试",
@@ -36,6 +42,7 @@ const zh: Messages = {
     startAgain: (ps5) => (ps5 ? "如需继续，请再次打开 PS5 上的 Dump Forge 磁贴。" : "如需继续，请再次运行同一条 ps5-dump-forge serve 命令。"),
     confirmStop: (web: boolean) => (web ? "停止 Dump Forge？" : "退出 PS5 Dump Forge？"),
     stopNote: (web, ps5) => (!web ? "没有正在运行的任务。" : ps5 ? "如需再次启动，请打开 PS5 上的 Dump Forge 磁贴。" : "如需再次启动，请重新运行同一条 ps5-dump-forge serve 命令。"),
+    peerBusy: "已配对的设备正在读取或写入这台电脑上的文件。退出会中断它的传输。",
     quit: "退出",
     github: (name) => `GitHub 上的 ${name}`,
     queued: "排队中",
@@ -47,14 +54,20 @@ const zh: Messages = {
     targetFormat: "目标格式",
     alreadyFolder: "源已经是文件夹",
     lz4Backport:
-      "此游戏的资源已用 LZ4 打包，且其 LZ4 清单包含向下移植文件：请先在“LZ4”选项卡中解包，再在此处移除向下移植。",
+      "此游戏的资源已用 LZ4 打包，且其 LZ4 清单包含向下移植文件：请先在“打包”选项卡中解包，再在此处移除向下移植。",
+    zstdBackport:
+      "此游戏的资源已用 zstd 打包，且其 zstd 索引包含向下移植文件：请先在“打包”选项卡中解包，再在此处移除向下移植。",
     unreadable: "无法构建：无法读取此源（见“源”）。",
+    patchBlocked: "无法构建：这是补丁包，只包含更新改动的内容。请在“编辑”中打开它以提取其中的文件。",
+    openInEdit: "在“编辑”中打开",
     noContentId: "无法构建为 fpkg：此游戏的 param.json 没有软件包所需的 Content ID。",
     blocked: (first, more) =>
       `无法构建：${first}${more > 0 ? `（另有 ${num(more)} 项，见“源”）` : ""}。`,
+    amprZstdRuntime: "此次转换会在 fakelib/libSceAmpr.sprx 安装 ampr-emu-ng，这些包需要它。",
+    amprNgReplaced: (version) => `将此游戏的 ampr-emu-ng 替换为 ampr_emu ${version}。`,
     amprRuntime: (a, own, version) => {
       if (a === "install") return `此游戏使用 AMPR 但没有 ampr_emu：转换时会安装内置的 ampr_emu ${version}。`;
-      if (a === "trace") return `转换时会用内置的正式版 ampr_emu ${version} 替换 LZ4 追踪运行时。`;
+      if (a === "trace") return `转换时会用内置的 ampr_emu ${version} 替换此游戏的 ampr_emu。`;
       if (a === "replace")
         return own
           ? `转换时会用内置的 ampr_emu ${version} 替换此游戏的 ampr_emu ${own}。`
@@ -63,10 +76,9 @@ const zh: Messages = {
         ? `此游戏的 ampr_emu ${own} 不低于内置的 ${version}：转换时会保留它。`
         : `此游戏已带有内置的 ampr_emu ${version}：转换时会保留它。`;
     },
-    amprIndex: (state, traces) =>
-      `${state === "stale" ? "ampr_emu.index 与此游戏的文件不符" : state === "damaged" ? "无法读取 ampr_emu.index" : "此游戏没有 ampr_emu.index"}：转换时会写入新的索引${traces ? "，并略去旧的追踪数据" : ""}。`,
-    amprPkgIndex: (traces) =>
-      `软件包会获得根据其中文件新建的 ampr_emu.index${traces ? "，并略去旧的追踪数据" : ""}。`,
+    amprIndex: (state: "stale" | "damaged" | "missing") =>
+      `${state === "stale" ? "ampr_emu.index 与此游戏的文件不符" : state === "damaged" ? "无法读取 ampr_emu.index" : "此游戏没有 ampr_emu.index"}：转换时会写入新的索引。`,
+    amprPkgIndex: "软件包会获得根据其中文件新建的 ampr_emu.index。",
     removeBackport: "移除向下移植",
     removeHint: (libs, emulators, other) =>
       `从 fakelib/ 中排除 ${num(libs)} 个向下移植库` +
@@ -99,62 +111,62 @@ const zh: Messages = {
         tagline: "最佳，前提是固件允许",
         cells: ["原生，全速", "减少 30–60%，视游戏而定"],
       },
+      zstd: { tagline: "需 ampr-emu-ng", cells: ["加载速度最多快 80%", "最多可缩小到游戏的一半"] },
       lz4: {
-        tagline: "实验性，适用于使用 AMPR 的游戏",
+        tagline: "需 ampr-emu-ng 或 ampr_emu",
         cells: ["加载快 30–40%（上游数据）", "约为游戏大小的一半（上游数据）"],
       },
       ffpkg: { tagline: "ShadowMountPlus 推荐格式", cells: ["镜像全速", FLAT] },
       exfat: { tagline: "兼容性", cells: ["镜像全速", FLAT] },
-      ffpfs: { tagline: "实验性", cells: ["镜像全速", FLAT] },
+      ffpfs: { tagline: "未压缩的 PFS", cells: ["镜像全速", FLAT] },
       ffpfsc: {
-        tagline: "体积最小，实验性",
+        tagline: "体积最小",
         cells: ["150–250 MB/s，可能卡顿", "取决于压缩级别，通常减少 30–60%"],
       },
       folder: { tagline: "普通游戏文件", cells: ["硬盘全速", FLAT] },
     },
     features: [
       ["转换", "可在文件夹、ffpkg、exfat、ffpfs、ffpfsc 与 fpkg 之间双向进行。"],
-      ["检查", "可在构建前查看游戏的封面、固件、向下移植、DLC 和文件名问题。"],
-      ["校验", "在写入后核对每个输出：默认快速抽样，也可按需逐字节核对。"],
-      ["删除", "经您确认后，将游戏从磁盘上移除。"],
-      ["LZ4", "追踪 AMPR 游戏，再打包其资源（实验性）。"],
-      ["AMPR 运行时", "每次转换都会安装或更新游戏的 ampr_emu（不低于内置版本的会保留），并更新过期的 ampr_emu.index。"],
-      ["PS5 payload", "在主机上运行同一个应用，可从局域网内任意设备打开。"],
+      ["传输", "通过 SMB、FTP 或 NFS，在您的 PS5、电脑和 NAS 之间发送文件和转换游戏。"],
+      ["编辑", "像操作文件夹一样修改游戏的文件，并在构建前查看其封面、固件、向下移植、DLC 和文件名问题。"],
+      ["流式", "可从任意来源到任意目标：无需临时副本，即使是 ffpfsc 内的镜像或压缩包中的游戏。"],
+      ["压缩包", "包含一款游戏的 .zip、.7z 或 .rar 可像文件夹一样浏览、转换或打包。"],
+      ["USB 和 SD 卡", "可写入 exFAT 或 FAT32 格式的 U 盘和存储卡。"],
+      ["打包", "以智能修复方式生成 zstd 或 LZ4 资源包。"],
+      ["存储", "您的游戏库，以及可重命名、移动和删除的文件浏览器。"],
+      ["安全", "除非您要求，否则绝不修改您的游戏；会跳过垃圾文件，并提前报告不合规的文件名。"],
     ],
-    howToConnect: "连接方法",
-    connectText: (url) => <>在本地网络中任意设备的浏览器里打开 {url}，或扫描此 QR 码。</>,
-    close: "关闭",
     about: "关于",
-    aboutText: "本工具可在任何平台（包括 PS5）上将游戏从任意格式转换为其他任意格式。",
-    connectAny: "如何从任意设备连接",
-    useAddress: (url) => <>打开 {url} 或扫描此 QR 码。</>,
     compare: "比较格式",
     compareLabel: "格式比较",
     format: "格式",
+    credits: "致谢",
     upstream: (app) =>
       `上游数据：来自 ampr_emu 和 Lazy_AMPR 作者的报告，并非 ${app} 实测；具体因游戏而异。ampr_emu 0.4.2.1 是上游的测试版本；已知问题：部分游戏在存档时崩溃。`,
     bundled: "LZ4 打包后的游戏使用 drakmor 的 ampr_emu 0.4.2.1（GPL-3.0）运行；该运行时原样内置，未作修改。源代码：",
-    lazy: "“先追踪、后打包”的流程沿用 Nazky 的 Lazy_AMPR：",
+    lazy: "打包策略基于 Nazky 的 Lazy_AMPR：",
+    ng: "zstd 和 LZ4 包运行于 ampr-emu-ng。源代码：",
+    logo: "标志由 Xxcco 设计：",
     unrar:
       ".rar 压缩包由内置的 UnRAR 库（作者 Alexander Roshal）读取（仅解压，遵循 UnRAR 许可）。",
     language: "语言",
     system: "跟随系统",
+    notifications: "任务完成时通知我",
+    notificationsHint: "转换、打包和传输任务的通知会显示在主机上。",
+    notificationsFailed: "无法更改通知设置。",
   },
-  // Inspect.tsx
-  inspect: {
-    files: "文件",
+  // Edit.tsx
+  edit: {
     details: "详情",
-    deleting: "正在删除源…",
+    deleting: "正在删除源",
     delete: "删除源",
     deleted: "已删除：",
-    contents: "源内容",
     filter: "按路径筛选",
     filterLabel: "按路径筛选文件",
     firstOf: (max, n) => `前 ${num(max)} 个，共 ${num(n)} 个`,
     fileCount: (n) => `${num(n)} 个文件`,
     noMatch: (f) => `没有与“${f}”匹配的文件。`,
     noListing: "不支持显示压缩包的文件列表。",
-    emptyDirs: (n) => `空文件夹（${num(n)}）`,
     noParam: "没有 sce_sys/param.json。",
     reader: "读取器",
     leftovers: "残留的文件和文件夹",
@@ -162,6 +174,135 @@ const zh: Messages = {
     leftoversNote: (app) =>
       `未完成的输出，通常来自被中断的任务。只删除您认得的项目，并且只在没有任务运行时删除；${app} 本身从不删除它们。`,
     checked: (n) => `已检查的文件夹（${num(n)}）`,
+    /** Edit's folds under the game card. */
+    facts: "游戏信息",
+    explorer: "游戏文件",
+    howTitle: "使用说明",
+    /** The empty state's paragraphs. */
+    how: (app) => [
+      "打开**游戏文件夹**或**镜像**，然后像操作 U 盘里的文件夹一样修改它：**添加和替换文件**（拖进来，或使用“添加”），**重命名和删除**。",
+      `**在您点击“应用”之前**不会有任何改动：您的修改会在这里逐项累积，然后 ${app} 一次性将它们直接写入镜像或文件夹，并检查结果。这**不是挂载的磁盘**：${app} 会记录您的修改并自行应用。`,
+      `修改放得下时，会**直接写入镜像**；放不下时（镜像内没有剩余空间，或格式无法接受这些修改），${app} 会在旁边构建一个包含您修改的新镜像，检查无误后再替换原镜像。无论哪种方式，一旦出错，镜像都会保持原样。`,
+      "压缩包可以浏览，但不能编辑。",
+    ],
+    location: "游戏中的位置",
+    root: "游戏",
+    up: "上级",
+    upTip: "返回上一级文件夹",
+    name: "名称",
+    size: "大小",
+    actions: "操作",
+    items: (n) => `${num(n)} 项`,
+    inFolder: (dirs, files) => `${num(dirs)} 个文件夹，${num(files)} 个文件`,
+    matches: (n) => `${num(n)} 个匹配项`,
+    emptyFolder: "此文件夹为空。",
+    open: (name) => `打开 ${name}`,
+    archiveNote: "压缩包可以浏览，但不能编辑。如需修改，请先将其转换为文件夹或镜像。",
+    nasNote: "NAS 上的游戏可以浏览和提取，但不能编辑。要修改它，请先将其转换或提取到本设备。",
+    patchNote: "这是补丁包：只包含更新改动的内容。这里列出它完整包含的文件；可以浏览和提取，但不能编辑。",
+    peerNote: "其他 Forge 上的游戏可以浏览和提取，但不能编辑。要修改它，请先将其转换或提取到本设备。",
+    /** The explorer's changes: none is made until Apply. */
+    addFiles: "添加文件",
+    addFolder: "添加文件夹",
+    pickAddFiles: "选择要添加的文件",
+    pickAddFolder: "选择要添加的文件夹",
+    peerRoot: "不能添加整个设备：请选择其中的文件夹。",
+    renameItem: (name) => `重命名 ${name}`,
+    removeItem: (name) => `删除 ${name}`,
+    renameTip: "重命名（F2）",
+    removeTip: "删除（Delete 键）",
+    removeTipMac: "删除（fn+Delete 键）",
+    /** Extract: copy files or folders out of the source into a folder chosen on this machine. */
+    extractItem: (name: string) => `解压 ${name}`,
+    extractTip: "复制到您选择的文件夹",
+    extractFolder: "解压文件夹",
+    extractFolderTip: "将当前显示的文件夹复制到您选择的文件夹",
+    extractGameTip: "将整个游戏复制到您选择的文件夹",
+    extractNotOnDisk: "此文件夹仅存在于您尚未应用的修改中：请先应用修改再解压。",
+    pickExtract: "选择解压位置",
+    extractPending: "按当前状态解压文件，不包含您尚未应用的修改。",
+    nameEmpty: "请输入名称。",
+    nameBad: "名称不能包含 / 或 \\，也不能是 . 或 ..",
+    nameTaken: (name) => `此处已存在 ${name}。`,
+    markNew: "新增",
+    markReplaced: "已替换",
+    markRenamed: "已重命名",
+    wasAt: (path) => `原位置：${path}`,
+    sizeLater: "内容过多，无法全部列出：其余部分将在应用修改时读取",
+    dropInto: (folder) => `拖放以添加到 ${folder}`,
+    droppedGone: (path) => `${path}：拖入的文件已不存在`,
+    pending: (n) => `${num(n)} 项修改尚未应用`,
+    undo: "撤销",
+    undoTip: "撤销上一次操作及其全部修改",
+    discard: "全部放弃",
+    discardTip: "放弃所有尚未应用的修改",
+    discardTitle: (n) => (n === 1 ? `放弃 ${num(n)} 项修改？` : `放弃全部 ${num(n)} 项修改？`),
+    discardText: "这些修改将被丢弃，游戏不会有任何变化。此操作无法撤销。",
+    discardNo: "否",
+    changesList: "修改（按顺序）",
+    willNotApply: (n) => `${num(n)} 项修改无法按现状应用。请撤销，或全部放弃。`,
+    opAdd: (to) => <>添加 {to}</>,
+    opAddFolder: (to) => <>添加文件夹 {to}</>,
+    opDelete: (path) => <>删除 {path}</>,
+    opRename: (from, to) => <>将 {from} 重命名为 {to}</>,
+    opMkdir: (path) => <>新建文件夹 {path}</>,
+    opFrom: (src) => <>来自 {src}</>,
+    whyInvalid: (path) => <>{path} 不是有效的游戏路径。</>,
+    whyMissing: (path) => <>游戏中没有 {path}。</>,
+    whyExists: (path) => <>{path} 已存在。</>,
+    whyFile: (path) => <>{path} 是文件。</>,
+    whyFolder: (path) => <>{path} 是文件夹。</>,
+    whyInto: (path) => <>{path} 不能移动到它自身之中。</>,
+    conflictTitle: (n) => `此处已存在 ${num(n)} 个项目`,
+    conflictIn: (folder) => <>位于 {folder}：</>,
+    conflictText:
+      "“替换”会用新项目取代它们：修改应用后，旧内容将永久消失，而有问题的文件可能导致游戏无法启动。添加到同名文件夹上的文件夹会被合并，其中同名的文件会被替换。",
+    replace: "替换",
+    skip: "跳过",
+    cancel: "取消",
+    /** How the changes go in (the pending bar), from core's check before Apply. */
+    modeLabel: "应用方式",
+    checking: "正在检查修改的应用方式",
+    nothingToChange: "没有要修改的内容：游戏保持原样。",
+    checkFailed: "无法检查修改：",
+    checkAgain: "重新检查",
+    inPlace: "原地修改",
+    rebuild: "重建",
+    rebuildNeeded: "需要重建",
+    cantApply: "无法应用",
+    changedDirectly: "直接修改",
+    folderText: "直接写入文件夹。",
+    inPlaceText: "写入镜像。",
+    inPlaceNeeds: (need, free) => `写入镜像；需要 ${need}，镜像内可用 ${free}。`,
+    noRoom: (need, free) => `这些修改需要 ${need}，而镜像内只有 ${free} 可用空间。`,
+    alwaysRebuilt: "ffpfsc 和 fpkg 镜像总是重建。",
+    rebuildText: "在旁边写入一个新镜像，校验通过后替换原镜像。",
+    rebuildNeeds: (need, free) => `在旁边写入一个新镜像（约需 ${need} 可用空间，当前可用 ${free}），校验通过后替换原镜像。`,
+    uploadLater: (n) => `来自此浏览器的 ${num(n)} 个文件将在您点击“应用”并上传完成后检查。`,
+    decidedOnApply: (n) =>
+      n === 1
+        ? "其他修改依赖来自此浏览器的这个文件，因此它们的应用方式将在您点击“应用”并上传完成后决定。"
+        : `其他修改依赖来自此浏览器的这 ${num(n)} 个文件，因此它们的应用方式将在您点击“应用”并上传完成后决定。`,
+    sourceLocked: "正在向此游戏应用修改。请在任务结束后再选择其他源。",
+    notOpened: (path) => <>未打开 {path}：正在向此游戏应用修改。请在任务结束后重新打开。</>,
+    apply: "应用",
+    applyTip: "应用此处列出的所有修改",
+    applyTitle: (n) => `应用 ${num(n)} 项修改？`,
+    applyInPlace: (name) => <>这些修改将直接写入 {name}。完成后无法撤销。</>,
+    applyRebuild: (name) => <>将在 {name} 旁边写入包含您修改的新镜像，校验后放到原镜像的位置。替换完成后无法撤销。</>,
+    closeImage: "如果游戏正从此镜像运行，请先关闭游戏。",
+    closeFolder: "如果游戏正从此文件夹运行，请先关闭游戏。",
+    applyRestores: "此镜像上一次的编辑被中断：会先将镜像恢复原状。",
+    uploadingFile: (i, n) => `正在上传第 ${num(i)} 个文件（共 ${num(n)} 个）`,
+    uploading: (i, n, sent, total) => `正在上传第 ${num(i)} 个文件（共 ${num(n)} 个）：${sent} / ${total}`,
+    uploadLabel: "上传",
+    uploadCancelled: "上传已取消。游戏没有任何变化。",
+    applyRunning: "正在应用修改。下方任务结束前无法继续编辑。",
+    applyFailed: "修改未能应用：",
+    applyRefused: "无法以这种方式应用修改：",
+    applyCancelled: "任务已取消。您的修改仍列在这里。",
+    folderPartly: "部分修改可能已写入文件夹：显示的文件就是文件夹当前的内容。",
+    interrupted: "此镜像上一次的编辑被中断。在检查或应用您接下来的修改之前，会先将镜像恢复原状。",
   },
   // JobList.tsx
   jobs: {
@@ -179,6 +320,7 @@ const zh: Messages = {
       pack: "正在打包",
       verify: "正在校验",
       finalize: "正在收尾",
+      install: "正在安装",
     },
     steps: {
       scan: "读取",
@@ -191,6 +333,7 @@ const zh: Messages = {
       pack: "打包",
       verify: "校验",
       finalize: "收尾",
+      install: "安装",
     },
     stepsLabel: "步骤",
     stepDone: (s) => `${s}（已完成）`,
@@ -201,13 +344,19 @@ const zh: Messages = {
     showFinder: "在访达中显示",
     showExplorer: "在资源管理器中显示",
     showFolder: "在文件夹中显示",
-    lz4: {
-      pack: "LZ4 打包",
-      unpack: "LZ4 解包",
-      trace: "LZ4 追踪",
-      unpatch: "LZ4 移除补丁",
-      runtime: "AMPR 运行时",
+    packTag: {
+      lz4Pack: (level: string) => `LZ4 打包 · ${level}`,
+      lz4Unpack: "LZ4 解包",
+      zstdPack: (level: string) => `zstd 打包 · ${level}`,
+      level: (n: number) => `级别 ${num(n)}`,
+      zstdUnpack: "zstd 解包",
+      withRules: (tag) => `${tag} · 自定义规则`,
     },
+    /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
+    edit: "编辑",
+    editRebuild: "编辑 · 重建",
+    transfer: "传输",
+    extract: "解压",
     job: (id) => `任务 ${id}`,
     done: "完成",
     cancelled: "已取消",
@@ -215,20 +364,30 @@ const zh: Messages = {
     cancelling: "正在取消…",
     queued: "排队中",
     dismiss: "移除",
+    retry: "重试",
+    retrying: "正在启动",
     stopJob: "停止任务？",
     cancel: "取消",
-    stopHint: "请在 4 秒内再次点击“停止任务？”以停止它。",
+    stopHint: "请在 4 秒内再次按下“停止任务？”以停止它。",
+    remoteLabel: (name, device) => `${name}，${device} 上的任务`,
+    remoteTitle: (device) => `在 ${device} 上运行，使用此设备的文件：在这里只能取消它`,
     from: "来源：",
     left: (d) => `剩余 ${d}`,
     inStep: (time) => `本步骤已用 ${time}`,
     result: (bytes, n) => `${bytes}，${num(n)} 个文件 →`,
     outputPath: "输出路径",
+    sourceDeleted: (v) => `已删除源：${v}`,
+    sourceKept: (v) => `已保留源：${v}`,
+    sourcePartlyDeleted: (v) => `已部分删除源：${v}`,
     checks: "检查项",
     verifiedPlain: (n) => `已校验：${num(n)} 项检查通过`,
     verifiedFull: (n) => `完整校验通过：${num(n)} 项检查`,
     verifiedFast: (n) => `快速校验通过：${num(n)} 项检查`,
     coverage: (checked, total, n) => `抽样 ${num(n)} 次，共核对 ${checked}（总计 ${total}）`,
     cantBuild: "无法构建此游戏：",
+    cantEdit: "无法应用修改：",
+    cantExtract: "无法解压：",
+    cantTransfer: "无法传输：",
     cantBuildAs: (f) => (
       <>
         无法将此游戏构建为 <b>{f}</b>：
@@ -252,11 +411,10 @@ const zh: Messages = {
     truncated: "已达到扫描上限。此列表可能不完整。",
     limits: "搜索最多深入六层文件夹，扫描约 15 秒后停止。",
     noRoots: "没有可扫描的文件夹。",
-    none: "未找到游戏。搜索最多深入六层并跳过系统文件夹。其他源仍可在“检查”或“转换”中选择。",
+    none: "未找到游戏。搜索最多深入六层并跳过系统文件夹。其他源仍可在“编辑”或“转换”中选择。",
     skipped: "已跳过的位置和文件",
-    stays: "结果会保留到您点击“刷新”为止。新的输出在刷新后显示。",
     library: "游戏库",
-    storageTip: "主机内部存储（/data）的可用空间，截至上次扫描",
+    storageTip: "主机内部存储（/data）的可用空间",
     free: (free, total) => (
       <>
         可用 <b>{free}</b>，共 {total}
@@ -266,84 +424,131 @@ const zh: Messages = {
     cards: "卡片视图",
     list: "列表视图",
     games: "游戏",
-    inspect: (n) => `检查 ${n}`,
+    edit: (n) => `编辑 ${n}`,
     convert: (n) => `转换 ${n}`,
     remove: (n) => `删除 ${n}`,
-    lz4Tip: "已用 LZ4 打包：ampr_emu 资源包",
-    lz4Packed: " 已打包",
+    deleting: (n) => `正在删除 ${n}`,
+    lz4Tip: "LZ4 资源包",
+    zstdTip: "zstd 资源包",
+    showAs: "显示方式",
+    kinds: "按类型显示",
+    all: "全部",
+    lz4Chip: "LZ4",
+    zstdChip: "zstd",
+    countIn: (n, path) => (
+      <>
+        <b>{num(n)}</b> 个游戏，位于 {path}
+      </>
+    ),
   },
-  // Lz4.tsx
-  lz4: {
-    title: "LZ4 资源包",
-    help: "LZ4 使用说明",
-    scenario: "LZ4 场景",
-    scenarios: { trace: "追踪", pack: "打包/解包" },
-    actions: { patch: "打补丁", unpatch: "移除补丁", pack: "打包", unpack: "解包" },
-    scenarioInfo: (s, packed) => s === "trace"
-      ? "记录游戏在您游玩时读取的资源，供打包使用。"
-      : packed
-        ? "将游戏的 LZ4 包还原为普通文件。"
-        : "将游戏的资源打包为 LZ4 卷，由 ampr_emu 在游戏运行时读取。",
-    traceInfo: (a, image) => a === "patch"
-      ? image
-        ? "用追踪运行时重新构建此镜像，然后替换原镜像。"
-        : "在此文件夹中安装追踪运行时。"
-      : image
-        ? "用正式版运行时重新构建此镜像，然后替换原镜像。"
-        : "在此文件夹中恢复正式版运行时。",
-    noAmpr: "该游戏未使用 AMPR",
-    packedFirst: "源已用 LZ4 打包：请先解包",
-    damaged: "其 LZ4 包已损坏",
-    archive: "压缩包无法追踪：请先转换",
-    chooseFirst: "请先选择源",
-    notRead: "尚未读取源",
-    pickProfile: "LZ4 配置文件",
-    profileFilter: "LZ4 配置文件（TOML）",
-    pickTracesFolder: "LZ4 追踪数据（包含 ampr_commands.bin 和 ampr_emu.index 的文件夹）",
-    pickTracesEither: "LZ4 追踪数据：zip 文件，或包含这两个文件的文件夹",
-    pickTracesZip: "LZ4 追踪数据（zip）",
-    unreadable: "无法开始：无法读取此源（见“源”）。",
-    pending: (a) => a === "patch"
-      ? "有任务正在运行或排队时无法打补丁。"
-      : "有任务正在运行或排队时无法移除补丁。",
-    replacing: "已有任务正在重新构建此镜像：请等待其完成。",
+  // Storage.tsx, Files.tsx: the Storage tab (Library | File explorer)
+  storage: {
+    views: "存储视图",
+    library: "游戏库",
+    files: "文件浏览器",
+    title: "文件浏览器",
+    pickTitle: "选择要浏览的文件夹",
+    pickPrompt: "选择一个文件夹以浏览其中的文件",
+    choose: "选择文件夹",
+    roots: "驱动器",
+    location: "位置",
+    folders: "文件夹",
+    up: "上级",
+    upTip: "返回上一级文件夹",
+    refresh: "刷新",
+    filter: "按名称筛选",
+    filterLabel: "按名称筛选此文件夹",
+    inFolder: (dirs, files) => `${num(dirs)} 个文件夹，${num(files)} 个文件`,
+    matches: (n) => `${num(n)} 个匹配项`,
+    firstOf: (max, n) => `前 ${num(max)} 个，共 ${num(n)} 个`,
+    truncated: "此文件夹包含超过 10,000 项：仅列出前 10,000 项。",
+    name: "名称",
+    size: "大小",
+    emptyFolder: "此文件夹为空。",
+    noMatch: (f) => `此处没有与“${f}”匹配的项。`,
+    noRoots: "没有可浏览的驱动器。",
+    cantList: "无法打开此文件夹：",
+    link: "链接",
+    linkTip: "链接：可以打开，但不能在这里重命名、移动或删除",
+    mounted: "已挂载",
+    mountedTip: "已由 ShadowMount+ 挂载：要删除、重命名或移动它，请先退出游戏并关闭 ShadowMount+",
+    mountedNote: "标为“已挂载”的映像正由 ShadowMount+ 使用：要删除、重命名或移动它们，请先退出游戏并关闭 ShadowMount+。",
+    open: (n) => `打开 ${n}`,
+    more: (n) => `${n} 的更多操作`,
+    rename: (n) => `重命名 ${n}`,
+    renameTip: "重命名（F2）",
+    move: (n) => `移动 ${n}`,
+    moveTip: "移动到其他文件夹",
+    moveTitle: (n) => `将 ${n} 移动到`,
+    remove: (n) => `删除 ${n}`,
+    removeTip: "删除（Delete 键）",
+    removeTipMac: "删除（fn+Delete 键）",
+    cantDelete: "无法删除：",
+    cantRename: "无法重命名：",
+    cantMove: "无法移动：",
+    sameFolder: "它已经在该文件夹中。",
+    deleted: (path) => `已删除 ${path}`,
+    renamed: (path) => `已重命名为 ${path}`,
+    moved: (path) => `已移动到 ${path}`,
+    devices: "设备",
+    thisDevice: "本设备",
+    otherDevice: "“移动”只在同一台设备内进行：要复制到其他设备，请拖到该设备的标签页上。",
+    dropCopy: (folder) => `松开即可复制到 ${folder}`,
+    dropMove: (folder) => `松开即可移动到 ${folder}`,
+    cantCopy: "无法复制：",
+    copyNoFolder: "请先在那台设备上打开一个文件夹。",
+    copyOne: (name, to) => `正在将 ${name} 复制到 ${to}。传输任务显示在“连接”中。`,
+    copyMany: (n, to) => `正在将 ${num(n)} 项复制到 ${to}。传输任务显示在“连接”中。`,
+    openConnect: "打开“连接”",
+  },
+  // Pack.tsx
+  pack: {
+    title: "打包",
+    help: "打包使用说明",
+    engine: "包的类型",
+    engines: { zstd: "zstd", lz4: "LZ4" },
+    actions: { pack: "打包", unpack: "解包" },
+    info: (e, packed) =>
+      e === "zstd"
+        ? packed
+          ? "将 zstd 包还原为普通文件。"
+          : "将游戏资源打包为 zstd 卷。"
+        : packed
+          ? "将 LZ4 包还原为普通文件。"
+          : "部分游戏可能无法启动。将游戏资源打包为 LZ4 卷。",
+    noAmprRuntime: "该游戏没有 AMPR 运行时：Pack 会注入 ampr-emu-ng。",
+    strategy: (s) => `打包策略：${s === "everything" ? "打包除系统文件外的全部文件" : "兼容 LZ4 策略"}。`,
+    patch: "补丁包无法打包。",
+    additionalContent: "附加内容（没有 eboot.bin）无法打包。",
+    unreadable: "无法开始：无法读取源（见“源”）。",
     blocked: (a, first, more) =>
-      `无法${a === "patch" ? "打补丁" : a === "unpatch" ? "移除补丁" : a === "pack" ? "打包" : "解包"}：${first}${more > 0 ? `（另有 ${num(more)} 项，见“源”）` : ""}。`,
-    chooseGame: "请先选择游戏文件夹或镜像。",
-    noAmprGame: "该游戏未使用 AMPR，因此这里无法使用 LZ4。",
-    installsRuntime: (a, version) =>
-      a === "pack"
-        ? `该游戏没有 ampr_emu：打包时会安装内置的 ampr_emu ${version}。`
-        : a === "patch"
-          ? `该游戏没有 ampr_emu：打补丁时会安装内置的追踪运行时（ampr_emu ${version}）。`
-          : `该游戏没有 ampr_emu：移除补丁时会安装内置的正式版运行时（ampr_emu ${version}）。`,
-    freshIndex: (state, a) =>
-      `${state === "stale" ? "ampr_emu.index 与此游戏的文件不符" : state === "damaged" ? "无法读取 ampr_emu.index" : "此游戏没有 ampr_emu.index"}：${a === "pack" ? "打包" : a === "patch" ? "打补丁" : "移除补丁"}时会写入新的索引。`,
-    unavailable: (items) => `不适用于此源：${items.join("；")}。`,
-    readOnly: (kind) => <>
-      <b>{kind}</b> 在主机上是只读的，因此无法追踪。请先将其转换为 <b>ffpkg</b> 或 <b>exfat</b>。
-    </>,
-    action: "操作",
-    traceAction: "追踪操作",
-    changes: (a, image) => a === "patch"
-      ? `将修改此${image ? "镜像" : "文件夹"}：追踪运行时替换 fakelib/libSceAmpr.sprx，不保留备份。`
-      : `将修改此${image ? "镜像" : "文件夹"}：恢复正式版运行时并删除追踪数据，不保留备份。`,
-    replay: (web) => `游玩后再次选择此源，即可使用其追踪数据。${web ? "“追踪”还可将其打包为 zip 提供下载。" : ""}`,
-    room: "追踪数据空间",
-    roomHint: "供游戏写入追踪数据的可用空间。请用 image_rw= 挂载镜像，否则不会记录任何内容。",
-    alreadyRelease: "已是正式版运行时：只会重新写入索引。",
-    spaceHint: "需要与镜像大小相当的可用空间；副本校验通过后才会替换镜像。",
-    deletesTraces: (a, bytes, web) =>
-      `${a === "patch" ? "打补丁" : "移除补丁"}会删除此源的追踪数据（${bytes}）：${web ? "请先下载。" : "请先复制一份。"}`,
-    useProfile: "改用规则配置文件",
-    profile: "配置文件",
-    choose: "选择",
-    profileHint: "包含打包规则的 TOML 文件，用于代替追踪数据。",
+      `无法${a === "pack" ? "打包" : "解包"}：${first}${more > 0 ? `（另有 ${num(more)} 项，见“源”）` : ""}。`,
     target: "目标",
-    packInto: "打包到",
-    direct: "直接打包到镜像中；游戏文件会读取两次。",
-    targetFormat: "目标格式",
-    unpackFolder: "新的游戏文件夹，其中的包已还原为普通文件。",
+    packFolder: (e) => `推荐。最快、延迟最低：新的游戏文件夹，其资源位于 ${e === "zstd" ? "zstd" : "LZ4"} 包中。`,
+    levels: { fast: "快速", medium: "中等", max: "最大" },
+    levelNotes: {
+      zstd: {
+        fast: { tone: "good", text: "推荐。zstd 5：快速，体积适中。" },
+        medium: { text: "zstd 9：更小，更慢。" },
+        max: { text: "zstd 19：最小；慢得多，占用更多内存。" },
+      },
+      lz4: {
+        fast: { tone: "good", text: "推荐。LZ4 默认：最快。" },
+        medium: { text: "LZ4 HC 9：更小，更慢。" },
+        max: { text: "LZ4 HC 12：最小，最慢。" },
+      },
+    },
+    runtime: "运行时",
+    runtimeNotes: {
+      ng: { tone: "good", text: "推荐。可读取 zstd 和 LZ4 包。" },
+      ampr_emu: { text: "上游 ampr_emu。" },
+    },
+    ngNote: "需要 ampr-emu-ng：打包时会将其安装到 fakelib/。请关闭 ShadowMount+ 的 fakelib 更新，否则它会替换运行时。",
+    installsRuntime: (version) => `这里没有 ampr_emu：打包时会安装 ampr_emu ${version}。`,
+    freshIndex: (state) =>
+      `${state === "stale" ? "ampr_emu.index 已过期" : state === "damaged" ? "ampr_emu.index 已损坏" : "没有 ampr_emu.index"}：打包时会写入新的。`,
+    direct: "直接打包到镜像中；游戏会读取两次。",
+    unpackFolder: "由普通文件组成的新游戏文件夹。",
     unpackHint: (n) =>
       n === null ? "将已打包的文件还原为普通文件。" : `将 ${num(n)} 个已打包的文件还原为普通文件。`,
     likelyFail: (fmt) => <>
@@ -354,74 +559,57 @@ const zh: Messages = {
     already: (a, fmt) => <>
       已有任务正在将此游戏输出为 <b>{fmt}</b>；再次{a === "pack" ? "打包" : "解包"}会生成第二份副本。
     </>,
-    profileRules: "按配置文件的规则打包；引擎直接打开的文件保持不打包。",
-    chosenRules: "打包游戏在这些追踪数据中读取过的文件；引擎直接打开的文件保持不打包。",
-    ownRules: "打包游戏在上一次追踪会话中读取过的文件；引擎直接打开的文件保持不打包。",
-    guessRules: "没有追踪数据：将按可靠性较低的内置推测打包。请先追踪，或选择追踪数据或配置文件。",
-    recorded: "已记录的追踪数据",
-    recordedHint: (bytes) => `ampr_commands.bin（${bytes}）：“打包”会使用这些追踪数据。`,
-    downloadHint: "关闭游戏并等待约一分钟，然后在电脑浏览器中下载。再在电脑上的“打包/解包”→“追踪数据”中选择该 zip。",
-    download: (bytes, zip) => `下载追踪数据（${bytes}），保存为 ${zip}`,
-    missingIndex: "此源中没有 ampr_emu.index：打包需要它与 ampr_commands.bin 放在一起。",
-    truncatedJournal: "末尾被截断的记录仍可打包，处理到最后一条完整记录为止。",
-    fakelibWarning: (recorded) => recorded
-      ? "追踪数据很少或没有？请关闭 fakelib 更新程序，重新打补丁后再玩一次。"
-      : "追踪期间请关闭 fakelib 更新程序，否则不会记录任何内容。",
-    emptyTitle: "请选择使用 AMPR 的游戏",
-    experimental: "实验性：请保留原始游戏的副本。",
-    chooseSource: "选择源",
     source: "源",
-    traces: "追踪数据",
-    optionalTraces: "追踪数据（可选）",
-    unlock: "解锁以选择其他追踪数据",
-    loaded: "已从此源加载追踪数据",
-    lockedHint: (bytes) => `此源自带的追踪数据（${bytes}）。点击锁形图标可改选其他追踪数据。`,
-    clear: "清除",
-    zip: "Zip",
-    folder: "文件夹",
-    tracesHint: "选择通过“下载追踪数据”得到的 amprtrace zip，或包含两个追踪文件的文件夹。",
-    useOwn: "使用源自带的追踪数据",
-    patchResult: (a, n) =>
-      `${a === "patch" ? "已打补丁：追踪运行时已安装" : "已移除补丁：正式版运行时已恢复"}；索引列出了 ${num(n)} 个文件。`,
-    removed: (files) => `已删除旧的追踪文件：${files.join("、")}。`,
+    rules: {
+      title: "自定义规则（TOML）",
+      titleWith: (name) => `自定义规则（TOML）：${name}`,
+      info: "使用 ampr_emu 的 ampr_pack.py 与 Lazy_AMPR 格式的打包策略配置文件，决定哪些文件打包、哪些保持独立。以最后一条匹配的规则为准；系统文件始终保持独立。",
+      warn: "规则有误可能导致游戏无法启动。请保留一份副本。",
+      pickTitle: "打包策略（TOML 文件）",
+      clear: "清除",
+    },
   },
-  // Lz4Help.tsx
-  lz4Help: {
-    title: "LZ4 使用说明",
+  // PackHelp.tsx
+  packHelp: {
+    title: "打包使用说明",
     close: "关闭",
-    warning: "实验性，仅适用于 AMPR 游戏。请保留原始游戏的副本。",
     body: () => (
       <>
-        <h3>1. 打包/解包</h3>
+        <h3>zstd</h3>
         <ol>
-          <li>
-            选择原始游戏、<b>打包/解包</b>，以及追踪数据（或配置文件）。
-          </li>
-          <li>输出已打包的文件夹或普通镜像；文件夹可在 <b>转换</b> 中转换为任意格式。</li>
-          <li>
-            对于已打包的源，这里显示的是 <b>解包</b>：文件会还原为普通文件。
-          </li>
-          <li>如果游戏自带的 ampr_emu 不低于内置版本且能读取 LZ4 包，打包会保留它；否则安装内置的正式版 ampr_emu；LZ4 追踪运行时也会被替换，没有 ampr_emu 的游戏也一样。</li>
+          <li>将游戏资源打包为 zstd 卷，输出到文件夹或镜像。</li>
+          <li><b>快速</b>（zstd 5）速度快；<b>中等</b>（9）和<b>最大</b>（19）体积更小，速度更慢。</li>
+          <li>已打包的游戏会显示<b>解包</b>：还原为普通文件。</li>
         </ol>
 
-        <h3>2. 追踪</h3>
+        <h3>LZ4</h3>
         <ol>
-          <li>
-            选择游戏的 <b>ffpkg</b> 或 <b>exfat</b>，然后依次选择 <b>追踪</b> → <b>打补丁</b>。
-          </li>
-          <li>关闭 fakelib 更新程序：它会覆盖追踪运行时。</li>
-          <li>
-            用 <span className="path">image_rw=</span> 挂载镜像，玩一次，然后关闭游戏。
-          </li>
-          <li>
-            在 PS5 页面上点击 <b>下载追踪数据</b>，或复制 ampr_commands.bin 和 ampr_emu.index。
-          </li>
+          <li><b>部分游戏可能无法启动。</b>请保留副本。</li>
+          <li>打包为 LZ4 卷，输出到文件夹或镜像：<b>快速</b>（LZ4）、<b>中等</b>（HC 9）、<b>最大</b>（HC 12）。</li>
+          <li>运行时：<b>ampr-emu-ng</b>（默认）或上游 <b>ampr_emu</b>。</li>
+          <li>已打包的游戏会显示<b>解包</b>。</li>
+        </ol>
+
+        <h3>ampr-emu-ng</h3>
+        <ol>
+          <li>可读取 zstd 和 LZ4 包；打包时会将其安装到 fakelib/。</li>
+          <li>请关闭 ShadowMount+ 的 fakelib 更新，否则它会替换运行时，游戏将无法读取它的包。</li>
+        </ol>
+
+        <h3>打包策略</h3>
+        <ol>
+          <li><b>打包除系统文件外的全部文件</b>（zstd，以及使用 ampr-emu-ng 的 LZ4）：打包除 eboot.bin、可执行文件与模块、sce_sys、sce_module、fakelib 和 .ini 文件（dlc_emu.ini 仍可编辑）以外的所有文件，其余文件（包括音频和视频）由 ampr-emu-ng 提供。</li>
+          <li><b>兼容 LZ4 策略</b>（使用 ampr_emu 的 LZ4）：配置、媒体等游戏直接读取的文件保持独立。</li>
+          <li>仅限打包：在<b>自定义规则（TOML）</b>中，从本设备或其他设备选择 ampr_pack.py 与 Lazy_AMPR 格式的配置文件。</li>
+          <li>以最后一条匹配的规则为准；系统文件始终保持独立。规则有误可能导致游戏无法启动。</li>
         </ol>
       </>
     ),
   },
   // Picker.tsx
   picker: {
+    devices: "设备",
+    thisDevice: "本设备",
     drives: "驱动器",
     location: "位置",
     parent: "上级文件夹",
@@ -432,22 +620,30 @@ const zh: Messages = {
     noFolders: "此处没有文件夹。",
     noImages: "此处没有文件夹、PS5 镜像或压缩包。",
     noFiles: (ext) => `此处没有文件夹或 ${dotted(ext, " 或 ")} 文件。`,
+    chooseFiles: (n) => (n === 0 ? "选择文件" : `选择 ${num(n)} 个文件`),
+    nothing: "此处没有文件夹或文件。",
+    cantList: "无法打开此文件夹：",
     cancel: "取消",
     chooseFolder: "选择此文件夹",
+    netOnlyHere: "压缩包和 fpkg 只能从本设备打开。",
+    shortcuts: "快捷方式",
+    addShortcut: "添加快捷方式",
+    removeShortcut: "移除快捷方式",
+    shortcutsFull: "最多 9 个快捷方式：请先移除一个。",
+    removeShortcutNamed: (name: string) => `移除快捷方式 ${name}`,
   },
   // common.tsx
   common: {
     folder: "文件夹",
-    pickFolder: "游戏文件夹",
-    pickImage: "游戏镜像或压缩包",
-    pickImageFilter: "镜像和压缩包",
-    pickFolderButton: "文件夹",
-    pickImageButton: "镜像/压缩包",
+    pickButton: "选择",
+    pickAny: "游戏文件夹、镜像或压缩包",
     source: "源",
     emptyTitle: "请选择游戏文件夹、镜像或压缩包",
-    emptyText: "PS5 游戏文件夹，或其镜像、安装包或压缩包。",
     accepted: "支持的源",
     unknownTitle: "未知游戏",
+    unsigned: (n: number) => `${num(n)} 个可执行文件未签名，游戏无法启动。转换游戏时会为其签名。`,
+    patch: "补丁",
+    additionalContent: "附加内容",
     reading: "正在读取源",
     unreadable: "无法读取的源",
     backport: "向下移植",
@@ -467,21 +663,14 @@ const zh: Messages = {
     files: (n) => `${num(n)} 个文件`,
     contentId: "内容 ID",
     noAmpr: "eboot.bin 未导入 libSceAmpr",
-    runtime: {
-      forge_release: "Forge 正式版",
-      forge_trace: "Forge 追踪版",
-      other: "其他",
-      none: "无",
-    },
-    packed: "已打包",
+    traceRuntime: "旧版 LZ4 追踪运行时",
+    noRuntime: "无运行时",
+    packed: (kind) => `已打包 (${kind})`,
+    zstdKept: "zstd 资源包：转换时会保留",
     damaged: "包已损坏",
-    traced: "已追踪",
-    plain: "未打包",
+    unpacked: "未打包",
     packedDetail: (files, volumes, percent) =>
       `${num(files)} 个文件，位于 ${num(volumes)} 个卷中` + (percent === null ? "" : `，为原大小的 ${num(percent)}%`),
-    journal: (size) => `记录 ${size}`,
-    noJournal: "尚无记录",
-    runtimeIs: (label) => `运行时：${label}`,
     index: {
       stale: "ampr_emu.index 已过期：转换时会更新",
       damaged: "ampr_emu.index 已损坏：转换时会重写",
@@ -492,7 +681,7 @@ const zh: Messages = {
         ? `转换时会安装内置的 ampr_emu ${version}`
         : a === "replace"
           ? `转换时会用内置的 ampr_emu ${version} 替换运行时`
-          : `ampr_emu ${version}：转换时会保留`,
+          : `转换时会保留`,
     backportLibs: (exclusive, n) =>
       `${exclusive ? "fakelib2/，单独挂载" : "fakelib/"}，${num(n)} 个向下移植库`,
     findings: "预检发现的问题",
@@ -520,12 +709,25 @@ const zh: Messages = {
   delete: {
     title: (folder) => (folder ? "删除此文件夹？" : "删除此镜像？"),
     text: (folder) =>
-      `${folder ? "该文件夹及其中所有内容" : "该镜像文件"}将被永久删除：不进废纸篓，无法撤销。如果删除中途停止，部分内容可能已被删除。`,
+      folder
+        ? "该文件夹及其中所有内容将被永久删除：不进废纸篓，无法撤销。如果删除中途停止，部分内容可能已被删除。"
+        : "该镜像文件将被永久删除：不进废纸篓，无法撤销。",
     no: "否",
     yes: "是，删除",
     archiveTitle: "删除此压缩包？",
     archiveText:
       "该压缩包文件将被永久删除：不进废纸篓，无法撤销。分卷压缩包的其他分卷保持不变。",
+    fileTitle: "删除此文件？",
+    fileText: "该文件将被永久删除：不进废纸篓，无法撤销。",
+  },
+  // replace.tsx
+  replace: {
+    title: (n) => `那里已存在 ${num(n)} 个项目`,
+    inFolder: (folder) => <>位于 {folder}：</>,
+    more: (n) => `以及另外 ${num(n)} 个`,
+    text: "“替换”会用新项目取代它们：旧文件将永久消失，不进废纸篓，也无法撤销。放到同名文件夹上的文件夹会被合并：其中同名的文件会被替换，其余内容保持不变。",
+    cancel: "取消",
+    replace: "替换",
   },
   // password.tsx
   password: {
@@ -557,6 +759,7 @@ const zh: Messages = {
       quitUnreachable: "无法连接 Dump Forge 以将其停止。",
       stillAnswering: "2 分钟后 Dump Forge 仍在响应；请检查 PS5。",
       gone: "Dump Forge 已不再报告此任务（在看到结果之前，它已从任务历史中移除）",
+      uploadIncomplete: "上传未完成。",
     },
   },
   // target.tsx
@@ -566,24 +769,20 @@ const zh: Messages = {
       exfat: {
         text: "适用于以 ffpkg 运行异常、只能像外置硬盘内容那样运行的游戏。也可在 Mac 或 PC 上打开。",
       },
-      ffpkg: { tone: "good", text: "推荐。PS5 自身的文件系统（UFS2）。可以以可写方式挂载。" },
+      ffpkg: { text: "PS5 自身的文件系统（UFS2）。可以以可写方式挂载。" },
       ffpfs: {
-        tone: "warn",
-        text: "实验性。PS5 的 PFS 文件系统，不压缩。文件名只能使用纯 ASCII 字符。",
+        text: "PS5 的 PFS 文件系统，不压缩。文件名只能使用纯 ASCII 字符。",
       },
       ffpfsc: {
-        tone: "warn",
-        text: "实验性。体积最小：包裹一个镜像的压缩容器，始终以只读方式挂载。",
+        text: "体积最小：包裹一个镜像的压缩容器，始终以只读方式挂载。",
       },
-      pkg: {
-        text: "像商店游戏一样安装，以原生速度运行。需要 kstuff、fpkg-enable 和 ppr-patch。",
-      },
+      pkg: { tone: "good", text: "推荐。像原生游戏一样运行，但前提是你的固件允许。" },
       lz4: {
-        tone: "warn",
-        text: "实验性。资源被打包为 LZ4 卷的游戏文件夹，由内置的 AMPR 模拟器（ampr_emu）在游戏运行时解包。仅适用于使用 AMPR 的游戏。",
+        text: "资源被打包为 LZ4 卷的游戏文件夹，由内置的 AMPR 模拟器（ampr_emu）在游戏运行时解包。",
       },
     },
-    innerFfpkg: { tone: "good", text: "推荐。PS5 自身的文件系统（UFS2）。" },
+    innerFfpkg: { text: "PS5 自身的文件系统（UFS2）。" },
+    innerExfat: { tone: "good", text: "推荐。压缩容器内最稳定的镜像。" },
     level0: { text: "不压缩：每个块按原样存储。文件与镜像一样大。" },
     levelDefault: {
       tone: "good",
@@ -616,13 +815,15 @@ const zh: Messages = {
         },
       },
     },
-    pkgFirmware: "仅适用于 11.60 及以下固件。",
     imageInside: "内部镜像",
     imageInsideLabel: "ffpfsc 内部的镜像",
     compressionLevel: "压缩级别",
     compression: "压缩",
     fullVerify: "完整校验",
     fullVerifyHint: "重新读取每个字节来核对输出。耗时更长。",
+    deleteSource: "删除源",
+    deleteSourceHint: "无法撤销。只有在转换成功后才会删除源。",
+    deleteSourceNas: "无法从这里删除 NAS 上的游戏。",
     separator: "名称中不能包含文件夹分隔符；请用“更改”选择文件夹。",
     badName: "名称不能为空，不能以点开头，不能以点或空格结尾，也不能包含控制字符。",
     tooLong: (bytes, max, folder) =>
@@ -639,7 +840,36 @@ const zh: Messages = {
     savedAs: (name, dir) => `将以 ${name} 保存在 ${dir}`,
     inDir: (dir) => `位于 ${dir}`,
     generate: "根据内容生成名称",
-    generatePattern: "[游戏名称]-[游戏 ID]",
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "输出名称",
+    parts: { title: "标题", title_id: "游戏 ID", version: "版本", pack: "打包类型", region: "地区", fw: "固件" },
+    template: "名称模板",
+    partsLabel: "插入部分",
+    insert: (part: string) => `插入${part}`,
+    inUse: (part) => `模板中已有${part}`,
+    example: "示例",
+    length: "长度",
+    bytes: (n, max) => `${n} / ${max} 字节。`,
+    room: (n) => `标题还剩 ${n} 字节。`,
+    noRoom: "没有留给标题的空间：标题会被省略。",
+    versionOut: "为腾出空间，版本会被省略。",
+    cut: "名称会截断为 63 字节。",
+    idOnly: "模板文字占满了 63 字节，因此改用游戏 ID 作为输出名称。",
+    limit: "ShadowMount+ 无法挂载名称超过 63 字节（ffpfsc 为 58 字节）的映像，因此更长的名称会先截短标题。",
+    errors: {
+      long: (max: number) => `模板最多 ${max} 字节。`,
+      open: "{ 缺少对应的 }。",
+      close: "} 缺少对应的 {。",
+      unknown: (token: string) => `{${token}} 不是名称的部分：请使用标题、游戏 ID、版本、打包类型、地区或固件。`,
+      twice: (token) => `模板中 {${token}} 出现了两次：每个部分只能使用一次。`,
+      char: (c: string) => `名称不能包含 ${c}。`,
+      control: "名称不能包含控制字符。",
+      needsName: "名称需要标题或游戏 ID。",
+    },
+    notSaved: "未保存：名称仍使用上一个有效的模板。",
+    reset: "重置",
   },
   // UpdateToast.tsx
   update: {
@@ -647,7 +877,7 @@ const zh: Messages = {
     update: "更新",
     later: "稍后",
     updating: "正在更新…",
-    updatingNote: "正在下载新版本，应用将自动重启。",
+    updatingNote: "正在下载新版本。此页面将自动重新加载为新版本。",
     downloading: "正在浏览器中下载：解压压缩包，用它替换当前这份程序。",
     failed: (v) => `无法更新到 v${v}`,
     timeout: (v) => `v${v} 未在 1 分钟内启动。如果已下载，请停止 Dump Forge 后重新打开以完成更新。`,
@@ -655,6 +885,187 @@ const zh: Messages = {
     close: "关闭",
   },
   // api.ts: prettyDuration's units
+  // Connect.tsx, ConnectHelp.tsx: pairing, Autodiscovery, saved devices
+  connect: {
+    thisDevice: "本设备",
+    howItWorks: "如何连接",
+    ipAddress: "IP 地址",
+    seen: (n: number, unit: "now" | "m" | "h" | "d") =>
+      unit === "m"
+        ? `上次在线：${num(n)} 分钟前`
+        : unit === "h"
+          ? `上次在线：${num(n)} 小时前`
+          : unit === "d"
+            ? `上次在线：${num(n)} 天前`
+            : "上次在线：刚刚",
+    listenError: (e) => `其他设备无法连接到本设备：${e}`,
+    unavailable: (e) => `连接功能不可用：${e}`,
+    loading: "正在加载",
+    discover: "自动发现",
+    stop: "停止",
+    fileTransfer: "文件传输",
+    devices: "设备",
+    show: "显示",
+    all: "全部",
+    onlineOf: (n, total) => `${num(n)}/${num(total)} 在线`,
+    sendFilesTo: (name) => `向 ${name} 发送文件`,
+    details: (name) => `${name} 的详细信息`,
+    userIs: (user) => `用户 ${user}`,
+    nearby: "附近",
+    nearbyNone: "没有找到新设备",
+    addDevice: "添加设备",
+    addressExample: "192.168.1.20 或 nas.local",
+    addByProtocol: "或按协议添加：",
+    savedEmpty: "还没有已保存的设备",
+    savedEmptyHint:
+      "“自动发现”会查找此网络中的 Forge 和网络存储。配对一台设备并在那台设备上允许，或保存一个 NAS。",
+    online: "在线",
+    offline: "离线",
+    computer: "电脑",
+    address: "地址",
+    keyId: "密钥 ID",
+    lastSeen: "上次在线",
+    status: "状态",
+    never: "从未",
+    unknown: "未知",
+    forget: "忘记",
+    forgetNote: "“忘记”只会删除本设备上的配对。要再次使用，请重新配对。",
+    close: "关闭",
+    cancel: "取消",
+    pairTitle: "配对设备",
+    pair: "配对",
+    connectTo: "连接",
+    probing: (address) => `正在检查 ${address}`,
+    pairing: "正在配对",
+    waitingFor: (address) => `正在等待 ${address} 允许配对`,
+    checkNumber: "校验码",
+    checkHint: "它必须与另一台设备显示的数字一致。",
+    denied: "另一台设备拒绝了配对。",
+    timedOut: "另一台设备上没有人及时允许配对。",
+    pairBusy: "另一台设备还有其他配对请求在等待。请一分钟后再试。",
+    alreadyPaired: "那台设备已保存了本设备。请先在那台设备上忘记它，然后重新配对。",
+    tooManyAttempts: "被拒绝的请求过多。请 10 分钟后再试。",
+    pairPromptTitle: (name) => `与 ${name} 配对？`,
+    pairPromptBody: (name, platform, ip) =>
+      `${name}（${platform}，${ip}）想与本设备配对。已配对的设备可以读取本设备的文件并添加新文件。`,
+    pairPromptCheck: (name) => `只有当 ${name} 显示相同的校验码时才允许。`,
+    allow: "允许",
+    deny: "拒绝",
+    notPaired: "另一台设备已不再认识本设备。请重新配对。",
+    searching: "正在此网络中搜索",
+    forge: "Forge",
+    save: "保存",
+    kindNas: "NAS",
+    nasAddTitle: (protocol) => `添加 ${protocol} NAS`,
+    nasEditTitle: (protocol) => `编辑 ${protocol} NAS`,
+    nasName: "名称",
+    nasAddressHint: "IP 地址或主机名；端口不是 445 时请加上 :端口",
+    nasUser: "用户名",
+    nasUserHint: "留空则以访客身份登录",
+    ftpAddressHint: "IP 地址或主机名；端口不是 21 时加上 :端口",
+    nfsAddressHint: "IP 地址或主机名；端口不是 2049 时加上 :端口",
+    ftpUserHint: "留空则匿名登录",
+    ftpNote: "FTP 不加密，登录信息也不加密。",
+    nfsNote: "NFS 没有登录：Forge 以 root 身份连接（先试 NFSv4.1，再试 NFSv3），因此服务器的导出必须允许本设备。NFS 不加密。",
+    nasPassword: "密码",
+    nasPasswordKeep: "留空则保留已保存的密码",
+    guest: "访客",
+    passwordSaved: "已保存",
+    passwordNone: "无",
+    edit: "编辑",
+    nasForgetNote: "“忘记”会从本设备删除此 NAS 及其保存的密码。",
+    pickSendFiles: "要发送的文件",
+    pickSendFolder: "要发送的文件夹",
+    pickSaveTo: "保存位置",
+    thisBrowser: "此浏览器",
+    browserHint: "将此手机或电脑上的文件放入本设备上的文件夹，并由此浏览器保存本设备上的文件。",
+    uploadTo: "上传到的文件夹",
+    uploadPick: "选择要上传的文件",
+    uploading: (name, i, n) => `正在上传 ${name}（第 ${num(i)} 个，共 ${num(n)} 个）`,
+    uploaded: "上传完成",
+    uploadSkipped: (names) => `未上传，那里已有同名的文件夹或链接：${names}。`,
+    uploadedBefore: (done, n) => `已上传 ${num(n)} 个文件中的 ${num(done)} 个，它们保留在本设备上。`,
+    cantStart: "无法开始传输：",
+    cantUpload: "无法上传：",
+    pickDownload: "要下载的文件",
+    transferIntro: "将任意设备上的文件或文件夹发送到本设备、已配对设备或 NAS 上的文件夹。传输会作为任务在任务列表中运行。",
+    send: "发送",
+    sendWhat: "要发送的内容",
+    sendTo: "发送到",
+    sendNeedsDevice: "请先连接另一台设备：配对一台 Forge 或添加 NAS。",
+    nothingChosen: "尚未选择",
+    chooseFiles: "选择文件",
+    chooseFolder: "选择文件夹",
+    startTransfer: "开始",
+    uploadHere: "上传到本设备",
+    downloadHere: "从本设备下载",
+    consoleNoFiles: "PS5 浏览器无法选择文件：请在手机或电脑上打开此页面。",
+    wholeRoot: "不能发送整个设备、共享或驱动器：请选择其中的文件夹。",
+    helpPhone: "扫描二维码即可在手机上打开此页面。在那里，“文件传输”中的“上传到本设备”和“从本设备下载”可传送手机上的文件。",
+    /** How to connect: short paragraphs, in order (no headings). */
+    help: [
+      "“连接”将同一网络中你的 PS5 和电脑上的 Dump Forge 联系起来。",
+      "要配对，请运行“自动发现”并在“附近”中选择“配对”，或在“添加设备”中输入地址，然后在另一台设备上允许。只有两个屏幕显示相同的校验码时才允许。",
+      "NAS（SMB、FTP、NFS）的添加方式相同。已配对的设备和 NAS 都可作为游戏来源和输出位置；不会在那里编辑它们上面的游戏。",
+      "“文件传输”可在它们之间复制文件和文件夹。目标位置已有同名项时，只有在你确认后才会替换。",
+    ],
+    helpSecurity: "设备之间发送的内容都不加密：同一网络中的任何人都能读取。保存的 NAS 密码以未加密形式保存在本设备上。请只在家庭网络中使用“连接”。",
+    helpSpeed: "已配对设备所在行或其详细信息中的“测速”会向它发送 128 MiB 并取回 128 MiB（不写入磁盘），显示每个方向的网络速度。",
+    speedTest: "测速",
+    speedTestWith: (name) => `与 ${name} 测速`,
+    speedTesting: "正在测速",
+    speedResult: (up, down) => `上传 ${up} MB/s · 下载 ${down} MB/s`,
+    speedFailed: "测速失败：",
+    speedNote: "发送 128 MiB 并取回 128 MiB；不写入磁盘。",
+    installTitle: "PS5 上的 Dump Forge",
+    ps5Address: "PS5 地址",
+    install: "安装到 PS5",
+    installHint: "需要主机的 ELF 加载器在网络上监听（端口 9021）。",
+    findingRelease: "正在 GitHub 上查找版本",
+    installing: (v, host) => `正在将 Dump Forge ${v} 安装到 ${host}`,
+    installed: (v, host) => `Dump Forge ${v} 正在 ${host} 上启动。运行后请在“添加设备”中配对。`,
+    noRelease: "在 GitHub 上找不到 Dump Forge 的 PS5 版本。请检查这台电脑的网络连接，然后重试。",
+    otherPayload: "其他任意 ELF 载荷：",
+    sendPayload: "发送载荷",
+    pickPayload: "选择 ELF 载荷",
+    sendingPayload: (name, host) => `正在将 ${name} 发送到 ${host}`,
+    sentPayload: (name, size, host) => `已将 ${name}（${size}）发送到 ${host}。`,
+    helpInstallTitle: "一键在 PS5 上安装 Dump Forge",
+    helpInstallText: "使用安装 Dump Forge 卡片将载荷发送到主机。它会从 GitHub 下载对应版本（或最新版本）并启动。",
+  },
+  // Packages.tsx (Storage's Package installer), InstallDialog.tsx, Files.tsx and Connect.tsx's Install pkg
+  install: {
+    view: "安装包安装器",
+    packages: "安装包",
+    refresh: "刷新",
+    scanning: "正在查找安装包",
+    none: "这台主机上没有找到安装包。",
+    noneHint: "将 .pkg 文件复制到主机存储或 USB 驱动器，然后点击“刷新”。",
+    truncated: "列表可能不完整",
+    limits: "搜索达到了某项上限而停止：可能缺少部分安装包。",
+    cantScan: "无法搜索：",
+    cantInstall: "无法安装：",
+    content: { game: "游戏", patch: "补丁", additional_content: "附加内容", unknown: "未知" },
+    install: "安装",
+    installName: (name) => `安装 ${name}`,
+    started: (name) => `正在安装 ${name}。任务显示在下方。`,
+    tag: "安装",
+    title: "安装此安装包？",
+    titleOn: (device) => `在 ${device} 上安装此安装包？`,
+    file: "文件",
+    game: "游戏",
+    titleId: "游戏 ID",
+    version: "版本",
+    size: "大小",
+    text: "PS5 会从 Dump Forge 获取安装包并安装。任务结束前请保持 Dump Forge 运行。",
+    reinstall: "如果此游戏已安装，PS5 会先删除已安装的副本，再安装这一个。",
+    cancel: "取消",
+    confirm: "安装",
+    installPkg: "安装 pkg",
+    installPkgOn: (device) => `在 ${device} 上安装安装包`,
+    pickTitle: "选择要安装的安装包",
+    sent: (device) => `${device} 正在安装安装包。任务显示在下方。`,
+  },
   duration: { s: (s) => `${s}秒`, ms: (m, s) => `${m}分${s}秒`, hm: (h, m) => `${h}小时${m}分钟` },
 };
 

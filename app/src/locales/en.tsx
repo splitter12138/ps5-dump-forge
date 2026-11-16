@@ -4,12 +4,12 @@
 
 import type { ReactNode } from "react";
 
-import type { Format, KrakenLevel, Lz4Facts } from "../api";
-import type { Rating, Row } from "../Formats";
+import type { Format, KrakenLevel, Lz4Runtime } from "../api";
+import type { Features, Rating, Row } from "../Formats";
 import type { ClientText } from "../http-client";
 import { dotted, num, plural } from "../i18n";
 import type { Failure } from "../launcher";
-import type { Lz4Action, Scenario, TraceAct } from "../Lz4";
+import type { Engine, PackAction, PackLevel } from "../Pack";
 import type { Note } from "../target";
 
 /** A flat image holds the game's files as they are: about as large as the game. */
@@ -18,15 +18,20 @@ const FLAT = "Equal to the game size";
 const en = {
   // App.tsx
   app: {
-    address: (url: string) => `Address: ${url}. Show how to connect, with a QR code`,
     screens: "Screens",
     convert: "Convert",
     active: (n: number) => `, ${num(n)} active`,
-    inspect: "Inspect",
-    library: "Library",
+    edit: "Edit",
+    pack: "Pack",
+    storage: "Storage",
+    connect: "Connect",
+    disconnected: "Disconnected",
+    connected: (n: number) => plural(n, { one: `Connected (${num(n)} device)`, other: `Connected (${num(n)} devices)` }),
     about: "About",
+    prevTab: "Previous tab (L2)",
+    nextTab: "Next tab (R2)",
     offline: "Offline, retrying…",
-    stop: "Stop Dump Forge",
+    stop: "Stop",
     stillRunning: (n: number): string => (n === 1 ? "A job is still running" : `${num(n)} jobs are still running`),
     job: (id: number) => `Job ${id}`,
     quitNote: (web: boolean, n: number) =>
@@ -35,6 +40,7 @@ const en = {
     stopAndQuit: (n: number): string => (n === 1 ? "Stop job and quit" : "Stop jobs and quit"),
     stoppingJobs: "Stopping jobs and cleaning up…",
     stoppingForge: "Stopping Dump Forge…",
+    quitting: "Quitting PS5 Dump Forge…",
     couldntStop: "Couldn't stop Dump Forge",
     close: "Close",
     tryAgain: "Try again",
@@ -43,6 +49,7 @@ const en = {
     /** Stop's question while no job runs (web: the payload; else the app, its jobs just finished). */
     confirmStop: (web: boolean): string => (web ? "Stop Dump Forge?" : "Quit PS5 Dump Forge?"),
     stopNote: (web: boolean, ps5: boolean): string => (!web ? "No job is running." : ps5 ? "To start it again, open the Dump Forge tile on the PS5." : "To start it again, run the same ps5-dump-forge serve command again."),
+    peerBusy: "A paired device is reading or writing files on this computer. Quitting stops its transfer.",
     quit: "Quit",
     github: (name: string) => `${name} on GitHub`,
     queued: "queued",
@@ -54,17 +61,24 @@ const en = {
     targetFormat: "Target format",
     alreadyFolder: "the source is already a folder",
     lz4Backport:
-      "This game's assets are LZ4 packed and its LZ4 manifest lists the backport: unpack it in the LZ4 tab first, then remove the backport here.",
+      "This game's assets are LZ4 packed and its LZ4 manifest lists the backport: unpack it in the Pack tab first, then remove the backport here.",
+    zstdBackport:
+      "This game's assets are zstd packed and its zstd index lists the backport: unpack it in the Pack tab first, then remove the backport here.",
     unreadable: "Can't build: this source couldn't be read (see Source).",
+    patchBlocked: "Can't build: this is a patch package, which holds only what the update changed. Open it in Edit to extract its files.",
+    openInEdit: "Open in Edit",
     noContentId: "Can't build as fpkg: this game's param.json has no content ID, which a package needs.",
     blocked: (first: string, more: number) =>
       `Can't build: ${first}${more > 0 ? ` (and ${num(more)} more, see Source)` : ""}.`,
     /** What the conversion does to an AMPR game's ampr_emu. `own` is the game's version:
      * for "keep", null when it is Forge's release runtime (the bundled one); for "replace", null
-     * when it names none. */
+     * when it names none. "trace": Forge's old LZ4 trace runtime, said as a plain replace. */
+    amprZstdRuntime: "This conversion installs ampr-emu-ng at fakelib/libSceAmpr.sprx, which these packs need.",
+    /** A game whose runtime is ampr-emu-ng that the conversion replaces with ampr_emu. */
+    amprNgReplaced: (version: string) => `Replaces this game's ampr-emu-ng with ampr_emu ${version}.`,
     amprRuntime: (a: "install" | "trace" | "replace" | "keep", own: string | null, version: string) => {
       if (a === "install") return `This game uses AMPR but has no ampr_emu: the conversion installs the bundled ampr_emu ${version}.`;
-      if (a === "trace") return `The conversion replaces the LZ4 trace runtime with the bundled release ampr_emu ${version}.`;
+      if (a === "trace") return `The conversion replaces this game's ampr_emu with the bundled ampr_emu ${version}.`;
       if (a === "replace")
         return own
           ? `The conversion replaces this game's ampr_emu ${own} with the bundled ampr_emu ${version}.`
@@ -73,11 +87,10 @@ const en = {
         ? `This game's ampr_emu ${own} is as new as the bundled ${version} or newer: the conversion keeps it.`
         : `This game already has the bundled ampr_emu ${version}: the conversion keeps it.`;
     },
-    amprIndex: (state: "stale" | "damaged" | "missing", traces: boolean) =>
-      `${state === "stale" ? "ampr_emu.index doesn't list this game's files" : state === "damaged" ? "ampr_emu.index can't be read" : "This game has no ampr_emu.index"}: the conversion writes a fresh one${traces ? " and leaves out the old traces" : ""}.`,
+    amprIndex: (state: "stale" | "damaged" | "missing") =>
+      `${state === "stale" ? "ampr_emu.index doesn't list this game's files" : state === "damaged" ? "ampr_emu.index can't be read" : "This game has no ampr_emu.index"}: the conversion writes a fresh one.`,
     /** A package's index: the builder always writes it afresh from what it packages. */
-    amprPkgIndex: (traces: boolean) =>
-      `The package gets a fresh ampr_emu.index built from the files it holds${traces ? ", without the old traces" : ""}.`,
+    amprPkgIndex: "The package gets a fresh ampr_emu.index built from the files it holds.",
     removeBackport: "Remove backport",
     /** What "Remove backport" leaves out and keeps: the emulators by name, and any other homebrew libraries. */
     removeHint: (libs: number, emulators: string[], other: boolean) =>
@@ -111,65 +124,63 @@ const en = {
         tagline: "Best, if your firmware allows",
         cells: ["Native, full speed", "30–60% less, depending on the game"],
       },
+      zstd: { tagline: "With ampr-emu-ng", cells: ["Up to 80% faster loading", "Up to half the game size"] },
       lz4: {
-        tagline: "Experimental, for games that use AMPR",
+        tagline: "With ampr-emu-ng or ampr_emu",
         cells: ["30–40% faster loading, upstream's numbers", "About half the game size, upstream's numbers"],
       },
       ffpkg: { tagline: "Recommended for ShadowMountPlus", cells: ["Full image speed", FLAT] },
       exfat: { tagline: "Compatibility", cells: ["Full image speed", FLAT] },
-      ffpfs: { tagline: "Experimental", cells: ["Full image speed", FLAT] },
+      ffpfs: { tagline: "Uncompressed PFS", cells: ["Full image speed", FLAT] },
       ffpfsc: {
-        tagline: "Smallest, experimental",
+        tagline: "Smallest",
         cells: ["150–250 MB/s, may stutter", "Depends on the compression level, usually 30–60% less"],
       },
       folder: { tagline: "Plain game files", cells: ["Full drive speed", FLAT] },
-    } satisfies Record<Format, Row>,
+    } satisfies Record<Format | "zstd", Row>,
     /** About's feature list: name, then a few words. */
     features: [
       ["Convert", "between a folder, ffpkg, exfat, ffpfs, ffpfsc and fpkg, both ways."],
-      ["Inspect", "a game's cover, firmware, backport, DLC and file name problems before you build."],
-      ["Verify", "every output after writing: a fast sample by default, every byte on request."],
-      ["Delete", "a game from the disk, after you confirm."],
-      ["LZ4", "trace an AMPR game, then pack its assets (experimental)."],
-      ["AMPR runtime", "every conversion installs or updates the game's ampr_emu (one as new as the bundled one or newer stays) and refreshes a stale ampr_emu.index."],
-      ["PS5 payload", "the same app on the console, open from any device on your network."],
-    ] as [string, string][],
-    howToConnect: "How to connect",
-    connectText: (url: ReactNode) => (
-      <>Open {url} in a browser on any device on your local network, or scan this code.</>
-    ),
-    close: "Close",
+      ["Transfer", "send files and convert games between your PS5, computers and a NAS over SMB, FTP or NFS."],
+      ["Edit", "a game's files like a folder, and see its cover, firmware, backport, DLC and file name problems before you build."],
+      ["Streamed", "from any source to any target: no temporary copy, not even the image inside an ffpfsc or a game in an archive."],
+      ["Archives", "a .zip, .7z or .rar holding one game is browsed, converted or packed like a folder."],
+      ["USB and SD cards", "written onto sticks and cards formatted exFAT or FAT32."],
+      ["Pack", "zstd or LZ4 asset packs with smart healing."],
+      ["Storage", "a Library of your games and a File explorer to rename, move and delete."],
+      ["Safe", "your game is never changed unless you ask; junk files are skipped and bad file names reported up front."],
+    ] as Features,
     about: "About",
-    aboutText: "This tool can convert a game from any format to any other, on any platform, including PS5.",
-    connectAny: "How to connect on any device",
-    useAddress: (url: ReactNode) => <>Use {url} or scan this code.</>,
     compare: "Compare formats",
     compareLabel: "Format comparison",
     format: "Format",
+    credits: "Credits",
     upstream: (app: string) =>
       `Upstream's numbers: what the authors of ampr_emu and Lazy_AMPR report, not measured by ${app}; they vary by game. ampr_emu 0.4.2.1 is an upstream test build; known issue: some games crash when saving.`,
     bundled: "LZ4 packed folders run on ampr_emu 0.4.2.1 by drakmor (GPL-3.0), bundled unmodified. Source:",
-    lazy: "The trace-then-pack workflow follows Lazy_AMPR by Nazky:",
+    lazy: "The packing strategy builds on Lazy_AMPR by Nazky:",
+    ng: "zstd and LZ4 packs run on ampr-emu-ng. Source:",
+    logo: "The logo is by Xxcco:",
     unrar:
       ".rar archives are read with the bundled UnRAR library by Alexander Roshal (extract only, under the UnRAR license).",
     language: "Language",
     system: "System",
+    notifications: "Notify when a job finishes",
+    notificationsHint: "Shows on the console for Convert, Pack and Transfer jobs.",
+    notificationsFailed: "Couldn't change notifications.",
   },
-  // Inspect.tsx
-  inspect: {
-    files: "Files",
+  // Edit.tsx
+  edit: {
     details: "Details",
-    deleting: "Deleting the source…",
+    deleting: "Deleting the source",
     delete: "Delete the source",
     deleted: "Deleted",
-    contents: "Source contents",
     filter: "Filter by path",
     filterLabel: "Filter files by path",
     firstOf: (max: number, n: number) => `first ${num(max)} of ${num(n)}`,
     fileCount: (n: number) => `${num(n)} ${plural(n, { one: "file", other: "files" })}`,
     noMatch: (f: string) => `No files match “${f}”.`,
     noListing: "Archive file listing is not supported.",
-    emptyDirs: (n: number) => `Empty folders (${num(n)})`,
     noParam: "No sce_sys/param.json.",
     reader: "Reader",
     leftovers: "Leftover files and folders",
@@ -177,6 +188,154 @@ const en = {
     leftoversNote: (app: string) =>
       `Unfinished outputs, usually from interrupted jobs. Remove only the ones you recognize, and only when no job is running; ${app} never deletes them itself.`,
     checked: (n: number) => `Folders checked (${num(n)})`,
+    /** Edit's folds under the game card. */
+    facts: "Game facts",
+    explorer: "Game files",
+    howTitle: "How this works",
+    /** The empty state's paragraphs; `**…**` is bold. */
+    how: (app: string): string[] => [
+      "Open a **game folder** or **image**, then change it like a folder on a USB stick: **add and replace files** (drag them in, or use Add), **rename and delete**.",
+      `Nothing changes **until you press Apply**: your changes stack up here, then ${app} writes them straight into the image or folder in one go and checks the result. It is **not a mounted drive**: ${app} keeps track of your changes and applies them itself.`,
+      `When the changes fit, they go **straight into the image**; when they don't (no room left inside, or a format that can't take them), ${app} builds a new image beside it with your changes and swaps it in once it checks out. Either way, if something fails, the image is left as it was.`,
+      "Archives can be browsed but not edited.",
+    ],
+    location: "Location in the game",
+    root: "Game",
+    up: "Up",
+    upTip: "Up one folder",
+    name: "Name",
+    size: "Size",
+    /** The row actions' column header (screen readers only). */
+    actions: "Actions",
+    items: (n: number) => `${num(n)} ${plural(n, { one: "item", other: "items" })}`,
+    inFolder: (dirs: number, files: number) =>
+      `${num(dirs)} ${plural(dirs, { one: "folder", other: "folders" })}, ${num(files)} ${plural(files, { one: "file", other: "files" })}`,
+    matches: (n: number) => `${num(n)} ${plural(n, { one: "match", other: "matches" })}`,
+    emptyFolder: "This folder is empty.",
+    open: (name: string) => `Open ${name}`,
+    archiveNote: "Archives can be browsed but not edited. Convert it to a folder or an image first to change it.",
+    nasNote: "Games on a NAS can be browsed and extracted but not edited. Convert it or extract it to this device first to change it.",
+    patchNote: "This is a patch package: it holds only what the update changed. The files it carries whole are listed; they can be browsed and extracted but not edited.",
+    peerNote: "Games on another Forge can be browsed and extracted but not edited. Convert it or extract it to this device first to change it.",
+    /** The explorer's changes: none is made until Apply. */
+    addFiles: "Add files",
+    addFolder: "Add folder",
+    pickAddFiles: "Choose files to add",
+    pickAddFolder: "Choose a folder to add",
+    peerRoot: "A whole device can't be added: choose a folder inside it.",
+    renameItem: (name: string) => `Rename ${name}`,
+    removeItem: (name: string) => `Delete ${name}`,
+    renameTip: "Rename (F2)",
+    removeTip: "Delete (Delete key)",
+    /** On a Mac the key marked delete is Backspace (Up a folder here). */
+    removeTipMac: "Delete (fn+Delete)",
+    /** Extract: copy files or folders out of the source into a folder chosen on this machine. */
+    extractItem: (name: string) => `Extract ${name}`,
+    extractTip: "Copy it to a folder you choose",
+    extractFolder: "Extract folder",
+    extractFolderTip: "Copy the folder shown to a folder you choose",
+    extractGameTip: "Copy the whole game to a folder you choose",
+    /** Extract folder's title while it is off: the folder shown is not on disk yet. */
+    extractNotOnDisk: "This folder exists only in your pending changes: apply them to extract it.",
+    pickExtract: "Choose where to extract to",
+    extractPending: "Extracts the files as they are now, without your pending changes.",
+    nameEmpty: "Type a name.",
+    nameBad: "A name can't hold / or \\, or be . or ..",
+    nameTaken: (name: string) => `${name} already exists here.`,
+    markNew: "New",
+    markReplaced: "Replaced",
+    markRenamed: "Renamed",
+    wasAt: (path: string) => `Was ${path}`,
+    sizeLater: "More than could be listed: the rest is read when the changes are applied",
+    dropInto: (folder: string) => `Drop to add to ${folder}`,
+    droppedGone: (path: string) => `${path}: the dropped file is no longer there`,
+    pending: (n: number) =>
+      plural(n, { one: `${num(n)} change not applied yet`, other: `${num(n)} changes not applied yet` }),
+    undo: "Undo",
+    undoTip: "Undo the last action, with all its changes",
+    discard: "Discard all",
+    discardTip: "Forget every change not applied yet",
+    discardTitle: (n: number) =>
+      plural(n, { one: `Discard ${num(n)} change?`, other: `Discard all ${num(n)} changes?` }),
+    discardText: "They are forgotten, and nothing in the game changes. This can't be undone.",
+    discardNo: "No",
+    changesList: "Changes, in order",
+    willNotApply: (n: number) =>
+      plural(n, {
+        one: `${num(n)} change won't apply as it is. Undo it, or discard all.`,
+        other: `${num(n)} changes won't apply as they are. Undo them, or discard all.`,
+      }),
+    opAdd: (to: ReactNode): ReactNode => <>Add {to}</>,
+    opAddFolder: (to: ReactNode): ReactNode => <>Add the folder {to}</>,
+    opDelete: (path: ReactNode): ReactNode => <>Delete {path}</>,
+    opRename: (from: ReactNode, to: ReactNode): ReactNode => <>Rename {from} to {to}</>,
+    opMkdir: (path: ReactNode): ReactNode => <>New folder {path}</>,
+    opFrom: (src: ReactNode): ReactNode => <>From {src}</>,
+    whyInvalid: (path: ReactNode): ReactNode => <>{path} is not a valid game path.</>,
+    whyMissing: (path: ReactNode): ReactNode => <>{path} is not in the game.</>,
+    whyExists: (path: ReactNode): ReactNode => <>{path} already exists.</>,
+    whyFile: (path: ReactNode): ReactNode => <>{path} is a file.</>,
+    whyFolder: (path: ReactNode): ReactNode => <>{path} is a folder.</>,
+    whyInto: (path: ReactNode): ReactNode => <>{path} can't move into itself.</>,
+    conflictTitle: (n: number) =>
+      plural(n, { one: `${num(n)} item already exists here`, other: `${num(n)} items already exist here` }),
+    conflictIn: (folder: ReactNode): ReactNode => <>In {folder}:</>,
+    conflictText:
+      "Replace puts the new ones in their place: once the changes are applied, the old contents are gone for good, and a bad file can stop the game from booting. A folder added onto a folder is merged, its files with the same names replaced.",
+    replace: "Replace",
+    skip: "Skip",
+    cancel: "Cancel",
+    /** How the changes go in (the pending bar), from core's check before Apply. */
+    modeLabel: "How to apply",
+    checking: "Checking how the changes can be applied",
+    nothingToChange: "Nothing to change: the game stays as it is.",
+    checkFailed: "Couldn't check the changes:",
+    checkAgain: "Check again",
+    inPlace: "In place",
+    rebuild: "Rebuild",
+    rebuildNeeded: "Rebuild needed",
+    cantApply: "Can't apply",
+    changedDirectly: "Changed directly",
+    folderText: "Written straight into the folder.",
+    inPlaceText: "Written into the image.",
+    inPlaceNeeds: (need: string, free: string) => `Written into the image; needs ${need} of its ${free} free.`,
+    noRoom: (need: string, free: string) => `The changes need ${need}, the image has ${free} free.`,
+    alwaysRebuilt: "ffpfsc and fpkg images are always rebuilt.",
+    rebuildText: "A new image is written beside it and replaces it once verified.",
+    rebuildNeeds: (need: string, free: string) =>
+      `A new image is written beside it (about ${need} free needed, ${free} free) and replaces it once verified.`,
+    uploadLater: (n: number) =>
+      plural(n, {
+        one: `${num(n)} file from this browser is checked once it is uploaded, when you press Apply.`,
+        other: `${num(n)} files from this browser are checked once they are uploaded, when you press Apply.`,
+      }),
+    decidedOnApply: (n: number) =>
+      plural(n, {
+        one: `Other changes build on the file from this browser, so how they go in is decided once it is uploaded, when you press Apply.`,
+        other: `Other changes build on the ${num(n)} files from this browser, so how they go in is decided once they are uploaded, when you press Apply.`,
+      }),
+    sourceLocked: "Changes are being applied to this game. Choose another source once the job ends.",
+    notOpened: (path: ReactNode): ReactNode => <>{path} wasn't opened: changes are being applied to this game. Open it again once the job ends.</>,
+    apply: "Apply",
+    applyTip: "Apply every change listed here",
+    applyTitle: (n: number) => plural(n, { one: `Apply ${num(n)} change?`, other: `Apply ${num(n)} changes?` }),
+    applyInPlace: (name: ReactNode): ReactNode => <>They are written straight into {name}. There is no undo once it is done.</>,
+    applyRebuild: (name: ReactNode): ReactNode => (
+      <>A new image with your changes is written beside {name}, verified, then put in its place. There is no undo once it replaces the image.</>
+    ),
+    closeImage: "If the game is running from this image, close it first.",
+    closeFolder: "If the game is running from this folder, close it first.",
+    applyRestores: "A previous edit of this image was interrupted: the image is put back as it was first.",
+    uploadingFile: (i: number, n: number) => `Uploading file ${num(i)} of ${num(n)}`,
+    uploading: (i: number, n: number, sent: string, total: string) => `Uploading file ${num(i)} of ${num(n)}: ${sent} of ${total}`,
+    uploadLabel: "Upload",
+    uploadCancelled: "Upload cancelled. Nothing in the game changed.",
+    applyRunning: "Applying the changes. Editing waits until the job below ends.",
+    applyFailed: "The changes weren't applied:",
+    applyRefused: "The changes can't be applied this way:",
+    applyCancelled: "The job was cancelled. Your changes are still listed here.",
+    folderPartly: "Part of them may already be in the folder: the files shown are what it holds now.",
+    interrupted: "A previous edit of this image was interrupted. The image is put back as it was before your next changes are checked or applied.",
   },
   // JobList.tsx
   jobs: {
@@ -195,6 +354,7 @@ const en = {
       pack: "Packing",
       verify: "Verifying",
       finalize: "Finishing",
+      install: "Installing",
     },
     /** The job row's step list: short labels, one per stage id; ids with the same label next to
      * each other are one step (preflight and check). */
@@ -209,6 +369,7 @@ const en = {
       pack: "Packing",
       verify: "Verifying",
       finalize: "Finishing",
+      install: "Installing",
     },
     stepsLabel: "Steps",
     /** Screen readers: a step's state (the current one is `aria-current`). */
@@ -220,13 +381,21 @@ const en = {
     showFinder: "Show in Finder",
     showExplorer: "Show in Explorer",
     showFolder: "Show in folder",
-    lz4: {
-      pack: "LZ4 pack",
-      unpack: "LZ4 unpack",
-      trace: "LZ4 trace",
-      unpatch: "LZ4 unpatch",
-      runtime: "AMPR runtime",
+    /** A Pack tab job's tag; a zstd pack with its level. */
+    packTag: {
+      lz4Pack: (level: string) => `LZ4 pack · ${level}`,
+      lz4Unpack: "LZ4 unpack",
+      zstdPack: (level: string) => `zstd pack · ${level}`,
+      level: (n: number) => `level ${num(n)}`,
+      zstdUnpack: "zstd unpack",
+      withRules: (tag: string) => `${tag} · custom rules`,
     },
+    /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
+    edit: "Edit",
+    editRebuild: "Edit · rebuild",
+    /** A transfer job's tag (Connect's copy job). */
+    transfer: "Transfer",
+    extract: "Extract",
     job: (id: number) => `Job ${id}`,
     done: "Done",
     cancelled: "Cancelled",
@@ -234,14 +403,21 @@ const en = {
     cancelling: "Cancelling…",
     queued: "Queued",
     dismiss: "Dismiss",
+    retry: "Retry",
+    retrying: "Starting",
     stopJob: "Stop job?",
     cancel: "Cancel",
-    stopHint: "Click Stop job? again within 4 seconds to stop it.",
+    stopHint: "Press Stop job? again within 4 seconds to stop it.",
+    remoteLabel: (name: string, device: string) => `${name}, a job on ${device}`,
+    remoteTitle: (device: string) => `Runs on ${device} and uses this device's files: you can only cancel it here`,
     from: "from ",
     left: (d: string) => `${d} left`,
     inStep: (time: string) => `${time} in this step`,
     result: (bytes: string, n: number) => `${bytes}, ${num(n)} ${plural(n, { one: "file", other: "files" })} →`,
     outputPath: "Output path",
+    sourceDeleted: (v: string) => `Source deleted: ${v}`,
+    sourceKept: (v: string) => `Source kept: ${v}`,
+    sourcePartlyDeleted: (v: string) => `Source partly deleted: ${v}`,
     checks: "Checks",
     verifiedPlain: (n: number) => `Verified: ${num(n)} ${plural(n, { one: "check", other: "checks" })} passed`,
     verifiedFull: (n: number) => `Full verification passed: ${num(n)} ${plural(n, { one: "check", other: "checks" })}`,
@@ -249,6 +425,9 @@ const en = {
     coverage: (checked: string, total: string, n: number) =>
       `Checked ${checked} of ${total} in ${num(n)} ${plural(n, { one: "sample", other: "samples" })}`,
     cantBuild: "Can't build this game:",
+    cantEdit: "Can't apply the changes:",
+    cantExtract: "Can't extract:",
+    cantTransfer: "Can't transfer:",
     cantBuildAs: (f: string) => (
       <>
         Can't build this game as <b>{f}</b>:
@@ -262,21 +441,20 @@ const en = {
     pickTitle: "Choose a Library folder",
     scanningIn: (name: string) => `Scanning ${name}`,
     scanning: "Scanning",
-    cantScanFolder: "Can’t scan this folder",
+    cantScanFolder: "Can't scan this folder",
     chooseAnother: "Choose another folder",
-    pickPrompt: "Pick a folder with your library to scan",
+    pickPrompt: "Choose a folder with your library to scan",
     choose: "Choose folder",
-    cantScan: "Can’t scan the Library:",
-    cantDelete: "Can’t delete:",
+    cantScan: "Can't scan the Library:",
+    cantDelete: "Can't delete:",
     deleted: (path: string) => `Deleted ${path}`,
     truncated: "Scan limit reached. This list may be incomplete.",
-    limits: "Discovery stops at six folder levels and after about 15 seconds of scanning.",
+    limits: "The scan stops at six folder levels and after about 15 seconds of scanning.",
     noRoots: "No folders are available to scan.",
-    none: "No games found. Discovery checks up to six levels deep and skips system folders. Other sources can still be chosen in Inspect or Convert.",
+    none: "No games found. The scan checks up to six levels deep and skips system folders. Other sources can still be chosen in Edit or Convert.",
     skipped: "Skipped locations and files",
-    stays: "Results stay here until you press Refresh. New outputs appear after refreshing.",
     library: "Library",
-    storageTip: "Free space on the console's internal storage (/data), as of the last scan",
+    storageTip: "Free space on the console's internal storage (/data)",
     free: (free: string, total: string) => (
       <>
         Free <b>{free}</b> of {total}
@@ -286,83 +464,137 @@ const en = {
     cards: "Card view",
     list: "List view",
     games: "Games",
-    inspect: (n: string) => `Inspect ${n}`,
+    edit: (n: string) => `Edit ${n}`,
     convert: (n: string) => `Convert ${n}`,
     remove: (n: string) => `Delete ${n}`,
-    lz4Tip: "LZ4 packed: ampr_emu asset packs",
-    lz4Packed: " packed",
+    deleting: (n: string) => `Deleting ${n}`,
+    lz4Tip: "LZ4 asset packs",
+    zstdTip: "zstd asset packs",
+    showAs: "Show as",
+    kinds: "Show kind",
+    all: "All",
+    lz4Chip: "LZ4",
+    zstdChip: "zstd",
+    countIn: (n: number, path: ReactNode) => (
+      <>
+        <b>{num(n)}</b> {plural(n, { one: "game in", other: "games in" })} {path}
+      </>
+    ),
   },
-  // Lz4.tsx
-  lz4: {
-    title: "LZ4 asset packs",
-    help: "How LZ4 works",
-    scenario: "LZ4 scenario",
-    scenarios: { trace: "Trace", pack: "Pack/Unpack" },
-    actions: { patch: "Patch", unpatch: "Unpatch", pack: "Pack", unpack: "Unpack" },
-    scenarioInfo: (s: Scenario, packed: boolean): string => s === "trace"
-      ? "Records which assets the game reads while you play, for Pack to use."
-      : packed
-        ? "Writes the game's LZ4 packs back as plain files."
-        : "Packs the game's assets into LZ4 volumes that ampr_emu reads while the game runs.",
-    traceInfo: (a: TraceAct, image: boolean): string => a === "patch"
-      ? image
-        ? "Rebuilds this image with the trace runtime, then replaces it."
-        : "Installs the trace runtime in this folder."
-      : image
-        ? "Rebuilds this image with the release runtime, then replaces it."
-        : "Puts the release runtime back in this folder.",
-    noAmpr: "the game doesn't use AMPR",
-    packedFirst: "the source is LZ4 packed: unpack it first",
-    damaged: "its LZ4 packs are damaged",
-    archive: "an archive can't be traced: convert it first",
-    chooseFirst: "choose a source first",
-    notRead: "the source isn't read yet",
-    pickProfile: "LZ4 profile",
-    profileFilter: "LZ4 profile (TOML)",
-    pickTracesFolder: "LZ4 traces (a folder with ampr_commands.bin and ampr_emu.index)",
-    pickTracesEither: "LZ4 traces: the zip, or a folder with both files",
-    pickTracesZip: "LZ4 traces (zip)",
-    unreadable: "Can't start: this source couldn't be read (see Source).",
-    pending: (a: TraceAct): string => a === "patch"
-      ? "Can't patch while jobs are running or queued."
-      : "Can't unpatch while jobs are running or queued.",
-    replacing: "A job is already rebuilding this image: wait for it to finish.",
-    blocked: (a: Lz4Action, first: string, more: number) =>
+  // Storage.tsx, Files.tsx: the Storage tab (Library | File explorer)
+  storage: {
+    views: "Storage view",
+    library: "Library",
+    files: "File explorer",
+    title: "File explorer",
+    pickTitle: "Choose a folder to browse",
+    pickPrompt: "Choose a folder to browse its files",
+    choose: "Choose folder",
+    roots: "Drives",
+    location: "Location",
+    folders: "Folders",
+    up: "Up",
+    upTip: "Up one folder",
+    refresh: "Refresh",
+    filter: "Filter by name",
+    filterLabel: "Filter this folder by name",
+    inFolder: (dirs: number, files: number) =>
+      `${num(dirs)} ${dirs === 1 ? "folder" : "folders"}, ${num(files)} ${files === 1 ? "file" : "files"}`,
+    matches: (n: number) => `${num(n)} ${n === 1 ? "match" : "matches"}`,
+    firstOf: (max: number, n: number) => `first ${num(max)} of ${num(n)}`,
+    truncated: "This folder holds more than 10,000 entries: only the first 10,000 are listed.",
+    name: "Name",
+    size: "Size",
+    emptyFolder: "This folder is empty.",
+    noMatch: (f: string) => `Nothing here matches “${f}”.`,
+    noRoots: "No drives are available to browse.",
+    cantList: "Can't open this folder:",
+    link: "Link",
+    linkTip: "A link: it can be opened, but not renamed, moved or deleted here",
+    mounted: "Mounted",
+    mountedTip: "Mounted by ShadowMount+: stop the game and turn ShadowMount+ off to delete, rename or move it",
+    mountedNote: "Images tagged Mounted are in use by ShadowMount+: stop the game and turn ShadowMount+ off to delete, rename or move them.",
+    open: (n: string) => `Open ${n}`,
+    more: (n: string) => `More actions for ${n}`,
+    rename: (n: string) => `Rename ${n}`,
+    renameTip: "Rename (F2)",
+    move: (n: string) => `Move ${n}`,
+    moveTip: "Move to another folder",
+    moveTitle: (n: string) => `Move ${n} to`,
+    remove: (n: string) => `Delete ${n}`,
+    removeTip: "Delete (Delete key)",
+    /** On a Mac the key marked delete is Backspace (Up a folder here). */
+    removeTipMac: "Delete (fn+Delete)",
+    cantDelete: "Can't delete:",
+    cantRename: "Can't rename:",
+    cantMove: "Can't move:",
+    sameFolder: "It is already in that folder.",
+    deleted: (path: string) => `Deleted ${path}`,
+    renamed: (path: string) => `Renamed to ${path}`,
+    moved: (path: string) => `Moved to ${path}`,
+    devices: "Devices",
+    thisDevice: "This device",
+    otherDevice: "Move to stays on one device: drag it onto another device's tab to copy it there.",
+    dropCopy: (folder: string) => `Drop to copy into ${folder}`,
+    dropMove: (folder: string) => `Drop to move into ${folder}`,
+    cantCopy: "Can't copy:",
+    copyNoFolder: "Open a folder on that device first.",
+    copyOne: (name: string, to: string) => `Copying ${name} to ${to}. The transfer is listed under Connect.`,
+    copyMany: (n: number, to: string) =>
+      plural(n, {
+        one: `Copying ${num(n)} item to ${to}. The transfer is listed under Connect.`,
+        other: `Copying ${num(n)} items to ${to}. The transfer is listed under Connect.`,
+      }),
+    openConnect: "Open Connect",
+  },
+  // Pack.tsx
+  pack: {
+    title: "Pack",
+    help: "How pack works",
+    engine: "Kind of packs",
+    engines: { zstd: "zstd", lz4: "LZ4" } satisfies Record<Engine, string>,
+    actions: { pack: "Pack", unpack: "Unpack" } satisfies Record<PackAction, string>,
+    info: (e: Engine, packed: boolean): string =>
+      e === "zstd"
+        ? packed
+          ? "Writes the zstd packs back as plain files."
+          : "Packs the game's assets into zstd volumes."
+        : packed
+          ? "Writes the LZ4 packs back as plain files."
+          : "Some games may not start. Packs the game's assets into LZ4 volumes.",
+    noAmprRuntime: "This game has no AMPR runtime: Pack injects ampr-emu-ng.",
+    strategy: (s: "everything" | "compatibility") => `Packing strategy: ${s === "everything" ? "pack everything except system files" : "compatibility LZ4 strategy"}.`,
+    patch: "A patch package can't be packed.",
+    additionalContent: "Additional content (no eboot.bin) can't be packed.",
+    unreadable: "Can't start: the source couldn't be read (see Source).",
+    blocked: (a: PackAction, first: string, more: number) =>
       `Can't ${a}: ${first}${more > 0 ? ` (and ${num(more)} more, see Source)` : ""}.`,
-    chooseGame: "Choose a game folder or image first.",
-    noAmprGame: "This game doesn't use AMPR, so LZ4 can't be used here.",
-    installsRuntime: (a: TraceAct | "pack", version: string) =>
-      a === "pack"
-        ? `This game has no ampr_emu: Pack installs the bundled ampr_emu ${version}.`
-        : a === "patch"
-          ? `This game has no ampr_emu: Patch installs the bundled trace runtime (ampr_emu ${version}).`
-          : `This game has no ampr_emu: Unpatch installs the bundled release runtime (ampr_emu ${version}).`,
-    freshIndex: (state: "stale" | "damaged" | "missing", a: TraceAct | "pack") =>
-      `${state === "stale" ? "ampr_emu.index doesn't list this game's files" : state === "damaged" ? "ampr_emu.index can't be read" : "This game has no ampr_emu.index"}: ${a === "pack" ? "Pack" : a === "patch" ? "Patch" : "Unpatch"} writes a fresh one.`,
-    unavailable: (items: string[]) => `Not for this source: ${items.join("; ")}.`,
-    readOnly: (kind: string): ReactNode => <>
-      <b>{kind}</b> is read-only on the console, so it can't be traced. Convert it to <b>ffpkg</b> or <b>exfat</b> first.
-    </>,
-    action: "Action",
-    traceAction: "Trace action",
-    changes: (a: TraceAct, image: boolean) => a === "patch"
-      ? `Changes this ${image ? "image" : "folder"}: the trace runtime replaces fakelib/libSceAmpr.sprx, with no backup.`
-      : `Changes this ${image ? "image" : "folder"}: the release runtime comes back and the traces are deleted, with no backup.`,
-    replay: (web: boolean) => `Play, then pick this source again to use its traces.${web ? " Trace also offers them as a zip." : ""}`,
-    room: "Room for the trace",
-    roomHint: "Free space for the game's trace. Mount the image with image_rw=, or nothing is recorded.",
-    alreadyRelease: "Already on the release runtime: only the index is rewritten.",
-    spaceHint: "Needs about the image's size of free space; the image is replaced only once the copy verifies.",
-    deletesTraces: (a: TraceAct, bytes: string, web: boolean) => `${a === "patch" ? "Patch" : "Unpatch"} deletes this source's traces (${bytes}): ${web ? "download them first." : "copy them first."}`,
-    useProfile: "Use a rules profile instead",
-    profile: "Profile",
-    choose: "Choose",
-    profileHint: "A TOML file of pack rules, used instead of traces.",
     target: "Target",
-    packInto: "Pack into",
-    direct: "Packs straight into the image; the game's files are read twice.",
-    targetFormat: "Target format",
-    unpackFolder: "A new game folder with the packs written back as plain files.",
+    packFolder: (e: Engine): string => `Recommended. Fastest, lowest latency: a new game folder, its assets in ${e === "zstd" ? "zstd" : "LZ4"} packs.`,
+    levels: { fast: "Fast", medium: "Medium", max: "Max" } satisfies Record<PackLevel, string>,
+    levelNotes: {
+      zstd: {
+        fast: { tone: "good", text: "Recommended. zstd 5: quick, good size." },
+        medium: { text: "zstd 9: smaller, slower." },
+        max: { text: "zstd 19: smallest; much slower, more memory." },
+      },
+      lz4: {
+        fast: { tone: "good", text: "Recommended. LZ4 default: quickest." },
+        medium: { text: "LZ4 HC 9: smaller, slower." },
+        max: { text: "LZ4 HC 12: smallest, slowest." },
+      },
+    } satisfies Record<Engine, Record<PackLevel, Note>>,
+    runtime: "Runtime",
+    runtimeNotes: {
+      ng: { tone: "good", text: "Recommended. Reads zstd and LZ4 packs." },
+      ampr_emu: { text: "Upstream ampr_emu." },
+    } satisfies Record<Lz4Runtime, Note>,
+    ngNote: "Needs ampr-emu-ng: Pack installs it in fakelib/. Turn off ShadowMount+'s fakelib update, or it replaces the runtime.",
+    installsRuntime: (version: string) => `No ampr_emu here: Pack installs ampr_emu ${version}.`,
+    freshIndex: (state: "stale" | "damaged" | "missing") =>
+      `${state === "stale" ? "ampr_emu.index is out of date" : state === "damaged" ? "ampr_emu.index is damaged" : "No ampr_emu.index"}: Pack writes a fresh one.`,
+    direct: "Packs straight into the image; reads the game twice.",
+    unpackFolder: "A new game folder with plain files.",
     unpackHint: (n: number | null) =>
       n === null
         ? "Writes the packed files back as plain files."
@@ -370,78 +602,61 @@ const en = {
     likelyFail: (fmt: string): ReactNode => <>
       Likely to fail as <b>{fmt}</b>: it refuses file names listed in Source.
     </>,
-    collides: (a: Lz4Action, folder: boolean) => `A job is already writing this ${folder ? "folder" : "file"}: ${a === "pack" ? "Pack" : "Unpack"} needs another name.`,
-    already: (a: Lz4Action, fmt: string): ReactNode => <>
+    collides: (a: PackAction, folder: boolean) => `A job is already writing this ${folder ? "folder" : "file"}: ${a === "pack" ? "Pack" : "Unpack"} needs another name.`,
+    already: (a: PackAction, fmt: string): ReactNode => <>
       Already writing this game as <b>{fmt}</b>; {a === "pack" ? "Pack" : "Unpack"} again makes a second copy.
     </>,
-    profileRules: "Packs what the profile's rules say; files the engine opens directly stay loose.",
-    chosenRules: "Packs the files the game read in these traces; files the engine opens directly stay loose.",
-    ownRules: "Packs the files the game read in its last traced session; files the engine opens directly stay loose.",
-    guessRules: "No traces: packs by a less reliable built-in guess. Trace first, or choose traces or a profile.",
-    recorded: "Recorded traces",
-    recordedHint: (bytes: string) => `ampr_commands.bin (${bytes}): Pack uses these traces.`,
-    downloadHint: "Close the game and wait a minute, then download from a computer's browser. Pick the zip there in Pack/Unpack → Traces.",
-    download: (bytes: string, zip: string) => `Download traces (${bytes}) as ${zip}`,
-    missingIndex: "No ampr_emu.index in this source: Pack needs it beside ampr_commands.bin.",
-    truncatedJournal: "A journal cut off at the end still packs, up to its last whole record.",
-    fakelibWarning: (recorded: boolean): string => recorded
-      ? "Few or no traces? Turn off the fakelib updater, Patch again and replay."
-      : "Turn off the fakelib updater while tracing, or nothing is recorded.",
-    emptyTitle: "Choose a game that uses AMPR",
-    experimental: "Experimental: keep a copy of the original game.",
-    chooseSource: "Choose source",
     source: "Source",
-    traces: "Traces",
-    optionalTraces: "Traces (optional)",
-    unlock: "Unlock to choose other traces",
-    loaded: "Traces are already loaded from this source",
-    lockedHint: (bytes: string) => `This source's own traces (${bytes}). Click the lock to choose others.`,
-    clear: "Clear",
-    zip: "Zip",
-    folder: "Folder",
-    tracesHint: "Pick the amprtrace zip from Download traces, or a folder with both trace files.",
-    useOwn: "Use the source's traces",
-    patchResult: (a: TraceAct, n: number) => `${a === "patch" ? "Patched: the trace runtime is installed" : "Unpatched: the release runtime is back"}; the index lists ${num(n)} ${plural(n, { one: "file", other: "files" })}.`,
-    removed: (files: string[]) =>
-      `Removed the old trace ${plural(files.length, { one: "file", other: "files" })}: ${files.join(", ")}.`,
+    rules: {
+      title: "Custom rules (TOML)",
+      titleWith: (name: string) => `Custom rules (TOML): ${name}`,
+      info: "A profile of the packing strategy in the format of ampr_emu's ampr_pack.py and Lazy_AMPR decides which files are packed and which stay loose. The last matching rule wins; system files always stay loose.",
+      warn: "Wrong rules can leave a game that won't start. Keep a copy.",
+      pickTitle: "Packing strategy (TOML file)",
+      clear: "Clear",
+    },
   },
-  // Lz4Help.tsx
-  lz4Help: {
-    title: "How LZ4 works",
+  // PackHelp.tsx
+  packHelp: {
+    title: "How pack works",
     close: "Close",
-    warning: "Experimental, for AMPR games only. Keep a copy of the original game.",
     body: () => (
       <>
-        <h3>1. Pack/Unpack</h3>
+        <h3>zstd</h3>
         <ol>
-          <li>
-            Choose the original game, <b>Pack/Unpack</b>, and the traces (or a profile).
-          </li>
-          <li>Write a packed folder or a plain image; a folder converts to any format in <b>Convert</b>.</li>
-          <li>
-            A packed source shows <b>Unpack</b> instead: the loose files come back.
-          </li>
-          <li>Pack keeps the game's ampr_emu if it is the bundled version or newer and can read LZ4 packs; otherwise it installs the bundled release one, also over the LZ4 trace runtime and in a game that has none.</li>
+          <li>Packs the game's assets into zstd volumes, into a folder or an image.</li>
+          <li><b>Fast</b> (zstd 5) is quick; <b>Medium</b> (9) and <b>Max</b> (19) are smaller, slower.</li>
+          <li>A packed game shows <b>Unpack</b>: the plain files come back.</li>
         </ol>
 
-        <h3>2. Trace</h3>
+        <h3>LZ4</h3>
         <ol>
-          <li>
-            Choose the game's <b>ffpkg</b> or <b>exfat</b>, then <b>Trace</b> → <b>Patch</b>.
-          </li>
-          <li>Turn off the fakelib updater: it overwrites the trace runtime.</li>
-          <li>
-            Mount it with <span className="path">image_rw=</span>, play one session, close the game.
-          </li>
-          <li>
-            <b>Download traces</b> from the PS5 page, or copy ampr_commands.bin and ampr_emu.index.
-          </li>
+          <li><b>Some games may not start.</b> Keep a copy.</li>
+          <li>Packs into LZ4 volumes, into a folder or an image: <b>Fast</b> (LZ4), <b>Medium</b> (HC 9), <b>Max</b> (HC 12).</li>
+          <li>Runtime: <b>ampr-emu-ng</b> (default) or upstream <b>ampr_emu</b>.</li>
+          <li>A packed game shows <b>Unpack</b>.</li>
+        </ol>
+
+        <h3>ampr-emu-ng</h3>
+        <ol>
+          <li>Reads zstd and LZ4 packs; Pack installs it in fakelib/.</li>
+          <li>Turn off ShadowMount+'s fakelib update, or it replaces the runtime and the game can't read its packs.</li>
+        </ol>
+
+        <h3>Packing strategy</h3>
+        <ol>
+          <li><b>Pack everything except system files</b> (zstd, and LZ4 with ampr-emu-ng): every file but eboot.bin, executables and modules, sce_sys, sce_module, fakelib and .ini files (dlc_emu.ini stays editable); ampr-emu-ng serves the rest, audio and video included.</li>
+          <li><b>Compatibility LZ4 strategy</b> (LZ4 with ampr_emu): configs, media and the other files a game reads directly stay loose.</li>
+          <li>Pack only: under <b>Custom rules (TOML)</b>, pick a profile in the format of ampr_pack.py and Lazy_AMPR, on this device or another one.</li>
+          <li>The last matching rule wins; system files always stay loose. Wrong rules can leave a game that won't start.</li>
         </ol>
       </>
     ),
   },
   // Picker.tsx
   picker: {
+    devices: "Devices",
+    thisDevice: "This device",
     drives: "Drives",
     location: "Location",
     parent: "Parent folder",
@@ -453,22 +668,34 @@ const en = {
     noFolders: "No folders here.",
     noImages: "No folders, PS5 images or archives here.",
     noFiles: (ext: string[]) => `No folders or ${dotted(ext, " or ")} files here.`,
+    chooseFiles: (n: number) => (n === 0 ? "Choose files" : plural(n, { one: `Choose ${num(n)} file`, other: `Choose ${num(n)} files` })),
+    nothing: "No folders or files here.",
+    cantList: "Can't open this folder:",
     cancel: "Cancel",
     chooseFolder: "Choose this folder",
+    netOnlyHere: "Archives and fpkg open from this device only.",
+    shortcuts: "Shortcuts",
+    addShortcut: "Add shortcut",
+    removeShortcut: "Remove shortcut",
+    shortcutsFull: "9 shortcuts at most: remove one first.",
+    removeShortcutNamed: (name: string) => `Remove shortcut ${name}`,
   },
   // common.tsx
   common: {
     folder: "Folder",
-    pickFolder: "Game folder",
-    pickImage: "Game image or archive",
-    pickImageFilter: "Images and archives",
-    pickFolderButton: "Folder",
-    pickImageButton: "Image/Archive",
+    pickButton: "Pick",
+    pickAny: "Game folder, image or archive",
     source: "Source",
     emptyTitle: "Choose a game folder, image or archive",
-    emptyText: "A PS5 game folder or an image, package or archive of one.",
     accepted: "Accepted sources",
     unknownTitle: "Unknown title",
+    unsigned: (n: number) =>
+      plural(n, {
+        one: `${num(n)} executable isn't signed, so the game won't start. Converting the game signs it.`,
+        other: `${num(n)} executables aren't signed, so the game won't start. Converting the game signs them.`,
+      }),
+    patch: "Patch",
+    additionalContent: "Additional content",
     reading: "Reading the source",
     unreadable: "Unreadable source",
     backport: "Backport",
@@ -488,22 +715,15 @@ const en = {
     files: (n: number) => `${num(n)} ${plural(n, { one: "file", other: "files" })}`,
     contentId: "Content ID",
     noAmpr: "eboot.bin does not import libSceAmpr",
-    runtime: {
-      forge_release: "Forge release",
-      forge_trace: "Forge trace",
-      other: "other",
-      none: "none",
-    } satisfies Record<Lz4Facts["runtime"], string>,
-    packed: "Packed",
+    traceRuntime: "Old LZ4 trace runtime",
+    noRuntime: "No runtime",
+    packed: (kind: "LZ4" | "zstd") => `Packed (${kind})`,
+    zstdKept: "zstd asset packs: a conversion keeps them",
     damaged: "Damaged packs",
-    traced: "Traced",
-    plain: "Plain",
+    unpacked: "Unpacked",
     packedDetail: (files: number, volumes: number, percent: number | null) =>
       `${num(files)} ${plural(files, { one: "file", other: "files" })} in ${num(volumes)} ${plural(volumes, { one: "volume", other: "volumes" })}` +
       (percent === null ? "" : `, ${num(percent)}% of size`),
-    journal: (size: string) => `journal ${size}`,
-    noJournal: "no journal yet",
-    runtimeIs: (label: string) => `runtime ${label}`,
     index: {
       stale: "ampr_emu.index out of date: a conversion refreshes it",
       damaged: "ampr_emu.index damaged: a conversion rewrites it",
@@ -515,7 +735,7 @@ const en = {
         ? `a conversion installs the bundled ampr_emu ${version}`
         : a === "replace"
           ? `a conversion replaces the runtime with the bundled ampr_emu ${version}`
-          : `ampr_emu ${version}: a conversion keeps it`,
+          : `a conversion keeps it`,
     backportLibs: (exclusive: boolean, n: number) =>
       `${exclusive ? "fakelib2/, mounted alone" : "fakelib/"}, ${num(n)} backport ${plural(n, { one: "library", other: "libraries" })}`,
     findings: "Preflight findings",
@@ -543,13 +763,27 @@ const en = {
   // delete.tsx
   delete: {
     title: (folder: boolean): string => (folder ? "Delete this folder?" : "Delete this image?"),
-    text: (folder: boolean) =>
-      `${folder ? "The folder and everything in it" : "The image file"} will be deleted for good: no Trash, no undo. If deleting stops part way, some of it may already be gone.`,
+    text: (folder: boolean): string =>
+      folder
+        ? "The folder and everything in it will be deleted for good: no Trash, no undo. If deleting stops part way, some of it may already be gone."
+        : "The image file will be deleted for good: no Trash, no undo.",
     no: "No",
     yes: "Yes, delete",
     archiveTitle: "Delete this archive?",
     archiveText:
       "The archive file will be deleted for good: no Trash, no undo. Other parts of a multi-part archive are left as they are.",
+    fileTitle: "Delete this file?",
+    fileText: "The file will be deleted for good: no Trash, no undo.",
+  },
+  // replace.tsx
+  replace: {
+    title: (n: number) =>
+      plural(n, { one: `${num(n)} item already exists there`, other: `${num(n)} items already exist there` }),
+    inFolder: (folder: ReactNode): ReactNode => <>In {folder}:</>,
+    more: (n: number) => `and ${num(n)} more`,
+    text: "Replace puts the new ones in their place: the old files are gone for good, no Trash, no undo. A folder onto a folder of the same name is merged: its files with the same names are replaced, everything else there stays.",
+    cancel: "Cancel",
+    replace: "Replace",
   },
   // password.tsx
   password: {
@@ -585,6 +819,7 @@ const en = {
       quitUnreachable: "Can't reach Dump Forge to stop it.",
       stillAnswering: "Dump Forge is still answering after 2 minutes; check the PS5.",
       gone: "no longer reported by Dump Forge (dropped from its job history before its result was seen)",
+      uploadIncomplete: "The upload didn't complete.",
     } satisfies Record<ClientText, string>,
   },
   // target.tsx
@@ -595,25 +830,21 @@ const en = {
       exfat: {
         text: "For games that misbehave as ffpkg and only run like external-drive content. Also opens on a Mac or PC.",
       },
-      ffpkg: { tone: "good", text: "Recommended. The PS5's own file system (UFS2). Writable mounts possible." },
+      ffpkg: { text: "The PS5's own file system (UFS2). Writable mounts possible." },
       ffpfs: {
-        tone: "warn",
-        text: "Experimental. The PS5's PFS file system, uncompressed. File names must be plain ASCII.",
+        text: "The PS5's PFS file system, uncompressed. File names must be plain ASCII.",
       },
       ffpfsc: {
-        tone: "warn",
-        text: "Experimental. Smallest: a compressed container around one image, always mounted read-only.",
+        text: "Smallest: a compressed container around one image, always mounted read-only.",
       },
-      pkg: {
-        text: "Installs like a store game and runs at native speed. Needs kstuff, fpkg-enable and ppr-patch.",
-      },
+      pkg: { tone: "good", text: "Recommended. Runs like a native game, but only if your firmware allows it." },
       lz4: {
-        tone: "warn",
-        text: "Experimental. A game folder with its assets packed into LZ4 volumes, which the bundled AMPR emulator (ampr_emu) unpacks while the game runs. Only for games that use AMPR.",
+        text: "A game folder with its assets packed into LZ4 volumes, which the bundled AMPR emulator (ampr_emu) unpacks while the game runs.",
       },
     } satisfies Record<Format, Note>,
     /** The inner `.ffpkg`'s line: the format's own, less what a read-only `.ffpfsc` doesn't give. */
-    innerFfpkg: { tone: "good", text: "Recommended. The PS5's own file system (UFS2)." } as Note,
+    innerFfpkg: { text: "The PS5's own file system (UFS2)." } as Note,
+    innerExfat: { tone: "good", text: "Recommended. The most stable image inside a compressed container." } as Note,
     level0: { text: "No compression: every block stored as it is. The file is as large as the image." } as Note,
     levelDefault: {
       tone: "good",
@@ -646,13 +877,15 @@ const en = {
         },
       },
     } satisfies Record<KrakenLevel, { label: string; note: Note }>,
-    pkgFirmware: "Works only on firmware 11.60 or lower.",
     imageInside: "Image inside",
     imageInsideLabel: "Image inside the ffpfsc",
     compressionLevel: "Compression level",
     compression: "Compression",
     fullVerify: "Full verification",
     fullVerifyHint: "Re-reads every byte to check the output. Takes longer.",
+    deleteSource: "Delete the source",
+    deleteSourceHint: "No undo. The source is deleted only after a successful conversion.",
+    deleteSourceNas: "A game on a NAS can't be deleted from here.",
     separator: "A name can't contain a folder separator; use Change for the folder.",
     badName: "A name can't be blank, start with a dot, end with a dot or a space, or hold control characters.",
     tooLong: (bytes: number, max: number, folder: boolean) =>
@@ -670,7 +903,36 @@ const en = {
     savedAs: (name: string, dir: string) => `saved as ${name} in ${dir}`,
     inDir: (dir: string) => `in ${dir}`,
     generate: "Generate name based on content",
-    generatePattern: "[game name]-[title ID]",
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "Output names",
+    template: "Name template",
+    parts: { title: "Title", title_id: "Title ID", version: "Version", pack: "Pack kind", region: "Region", fw: "Firmware" },
+    partsLabel: "Insert a part",
+    insert: (part: string) => `Insert ${part}`,
+    inUse: (part: string) => `${part} is already in the template`,
+    example: "Example",
+    length: "Length",
+    bytes: (n: number, max: number) => `${n} of ${max} bytes.`,
+    room: (n: number) => plural(n, { one: `${num(n)} byte is left for the title.`, other: `${num(n)} bytes are left for the title.` }),
+    noRoom: "No room is left for the title: it is left out.",
+    versionOut: "The version is left out to make room.",
+    cut: "The name is cut at 63 bytes.",
+    idOnly: "The template's own text fills the 63 bytes, so the title ID names the output.",
+    limit: "ShadowMount+ can't mount an image whose name is longer than 63 bytes (58 for ffpfsc), so a longer name has its title cut first.",
+    errors: {
+      long: (max: number) => `A template is at most ${max} bytes.`,
+      open: "A { has no closing }.",
+      close: "A } has no opening {.",
+      unknown: (token: string) => `{${token}} isn't a part: use Title, Title ID, Version, Pack kind, Region or Firmware.`,
+      twice: (token: string) => `{${token}} is in the template twice: use each part once.`,
+      char: (c: string) => `A name can't hold ${c}.`,
+      control: "A name can't hold a control character.",
+      needsName: "A name needs Title or Title ID.",
+    },
+    notSaved: "Not saved: names keep the last template that worked.",
+    reset: "Reset",
   },
   // UpdateToast.tsx: a newer release (checked at every start)
   update: {
@@ -678,12 +940,204 @@ const en = {
     update: "Update",
     later: "Later",
     updating: "Updating…",
-    updatingNote: "New version is downloading, the app will restart itself.",
+    updatingNote: "The new version is downloading. This page reloads into it by itself.",
     downloading: "Downloading in your browser: unpack the archive and replace this copy.",
     failed: (v: string) => `Couldn't update to v${v}`,
     timeout: (v: string) => `v${v} didn't start within a minute. If it was downloaded, stop Dump Forge and open it again to finish the update.`,
     retry: "Retry",
     close: "Close",
+  },
+  // Connect.tsx, ConnectHelp.tsx: pairing, Autodiscovery, saved devices
+  connect: {
+    thisDevice: "This device",
+    howItWorks: "How to connect",
+    ipAddress: "IP address",
+    seen: (n: number, unit: "now" | "m" | "h" | "d") =>
+      unit === "m"
+        ? plural(n, { one: `seen: ${num(n)} minute ago`, other: `seen: ${num(n)} minutes ago` })
+        : unit === "h"
+          ? plural(n, { one: `seen: ${num(n)} hour ago`, other: `seen: ${num(n)} hours ago` })
+          : unit === "d"
+            ? plural(n, { one: `seen: ${num(n)} day ago`, other: `seen: ${num(n)} days ago` })
+            : "seen: just now",
+    listenError: (e: string) => `Other devices can't reach this one: ${e}`,
+    unavailable: (e: string) => `Connect isn't available: ${e}`,
+    loading: "Loading",
+    discover: "Autodiscovery",
+    stop: "Stop",
+    fileTransfer: "File Transfer",
+    devices: "Devices",
+    show: "Show",
+    all: "All",
+    onlineOf: (n: number, total: number) => `${num(n)} of ${num(total)} online`,
+    sendFilesTo: (name: string) => `Send files to ${name}`,
+    details: (name: string) => `Details of ${name}`,
+    userIs: (user: string) => `user ${user}`,
+    nearby: "Nearby",
+    nearbyNone: "No new devices found",
+    addDevice: "Add a device",
+    addressExample: "192.168.1.20 or nas.local",
+    addByProtocol: "Or add by protocol:",
+    savedEmpty: "No saved devices yet",
+    savedEmptyHint:
+      "Autodiscovery finds Forge and network storage on this network. Pair a device and allow it there, or save a NAS.",
+    online: "Online",
+    offline: "Offline",
+    computer: "Computer",
+    address: "Address",
+    keyId: "Key ID",
+    lastSeen: "Last seen",
+    status: "Status",
+    never: "Never",
+    unknown: "Unknown",
+    forget: "Forget",
+    forgetNote: "Forget removes the pairing on this device only. To use it again, pair it again.",
+    close: "Close",
+    cancel: "Cancel",
+    pairTitle: "Pair a device",
+    pair: "Pair",
+    connectTo: "Connect",
+    probing: (address: string) => `Checking ${address}`,
+    pairing: "Pairing",
+    /** The Pair dialog while the other device's user decides. */
+    waitingFor: (address: string) => `Waiting for ${address} to allow the pairing`,
+    checkNumber: "Check number",
+    checkHint: "It must match the number the other device shows.",
+    denied: "The other device denied the pairing.",
+    timedOut: "Nobody allowed the pairing on the other device in time.",
+    pairBusy: "The other device has other pairing requests waiting. Try again in a minute.",
+    alreadyPaired: "That device already has this one saved. Forget it there first, then pair again.",
+    tooManyAttempts: "Too many refused requests. Try again in 10 minutes.",
+    /** The prompt on the device asked to pair. */
+    pairPromptTitle: (name: string) => `Pair with ${name}?`,
+    pairPromptBody: (name: string, platform: string, ip: string) =>
+      `${name} (${platform}, ${ip}) wants to pair with this device. A paired device can read this device's files and add new ones.`,
+    pairPromptCheck: (name: string) => `Allow it only if ${name} shows the same check number.`,
+    allow: "Allow",
+    deny: "Deny",
+    notPaired: "The other device doesn't know this one any more. Pair it again.",
+    searching: "Searching this network",
+    forge: "Forge",
+    save: "Save",
+    kindNas: "NAS",
+    nasAddTitle: (protocol: string) => `Add an ${protocol} NAS`,
+    nasEditTitle: (protocol: string) => `Edit ${protocol} NAS`,
+    nasName: "Name",
+    nasAddressHint: "IP address or host name; add :port when it isn't 445",
+    nasUser: "User name",
+    nasUserHint: "Leave empty to sign in as a guest",
+    ftpAddressHint: "IP address or host name; add :port when it isn't 21",
+    nfsAddressHint: "IP address or host name; add :port when it isn't 2049",
+    ftpUserHint: "Leave empty to sign in anonymously",
+    ftpNote: "FTP is not encrypted, the login included.",
+    nfsNote: "NFS has no login: Forge connects as root (NFSv4.1, else NFSv3), so the server's export must allow this device. NFS is not encrypted.",
+    nasPassword: "Password",
+    nasPasswordKeep: "Leave empty to keep the saved password",
+    guest: "Guest",
+    passwordSaved: "Saved",
+    passwordNone: "None",
+    edit: "Edit",
+    nasForgetNote: "Forget removes this NAS and its saved password from this device.",
+    pickSendFiles: "Files to send",
+    pickSendFolder: "Folder to send",
+    pickSaveTo: "Where to save it",
+    thisBrowser: "This browser",
+    browserHint: "Files from this phone or computer go into a folder on this device, and a file from this device is saved by this browser.",
+    uploadTo: "Folder to upload into",
+    uploadPick: "Choose files to upload",
+    uploading: (name: string, i: number, n: number) => `Uploading ${name} (${num(i)} of ${num(n)})`,
+    uploaded: "Upload finished",
+    /** Files not uploaded: a folder or link of the same name is in the folder chosen. */
+    uploadSkipped: (names: string) => `Not uploaded, a folder or link of that name is there: ${names}.`,
+    uploadedBefore: (done: number, n: number) =>
+      plural(done, {
+        one: `${num(done)} of ${num(n)} files was uploaded and stays on this device.`,
+        other: `${num(done)} of ${num(n)} files were uploaded and stay on this device.`,
+      }),
+    cantStart: "Can't start the transfer:",
+    cantUpload: "Can't upload:",
+    pickDownload: "File to download",
+    transferIntro: "Send files or a folder from any device into a folder here, on a paired device or on a NAS. The transfer runs as a job in the job list.",
+    send: "Send",
+    sendWhat: "What to send",
+    sendTo: "Send to",
+    /** Under Send to while no other device (paired Forge or NAS) is online: the button is off. */
+    sendNeedsDevice: "Connect another device first: pair a Forge or add a NAS.",
+    nothingChosen: "Nothing chosen yet",
+    chooseFiles: "Choose files",
+    chooseFolder: "Choose a folder",
+    startTransfer: "Start",
+    uploadHere: "Upload to this device",
+    downloadHere: "Download from this device",
+    consoleNoFiles: "The console's browser can't pick files: open this page on a phone or computer.",
+    wholeRoot: "A whole device, share or drive can't be sent: choose a folder inside it.",
+    helpPhone: "Scan the QR code to open this page on a phone. There, Upload to this device and Download from this device in File Transfer move the phone's files.",
+    /** How to connect: short paragraphs, in order (no headings). */
+    help: [
+      "Connect links Dump Forge on your PS5 and computers on the same network.",
+      "To pair, run Autodiscovery and choose Pair under Nearby, or type an address under Add a device, then allow it on the other device. Allow it only when both screens show the same check number.",
+      "A NAS (SMB, FTP, NFS) is added the same way. Paired devices and NAS devices are game sources and outputs; their games aren't edited there.",
+      "File Transfer copies files and folders between any of them. A name that already exists there is replaced only after you confirm.",
+    ] as string[],
+    helpSecurity: "Nothing sent between devices is encrypted: anyone on your network can read it. A saved NAS password is kept on this device unencrypted. Use Connect on your home network only.",
+    helpSpeed: "Speed test, in a paired device's row or its details, sends 128 MiB to it and fetches 128 MiB back, nothing written to disk, and shows the network's speed each way.",
+    speedTest: "Speed test",
+    speedTestWith: (name: string) => `Speed test with ${name}`,
+    speedTesting: "Testing",
+    speedResult: (up: string, down: string) => `Upload ${up} MB/s · Download ${down} MB/s`,
+    speedFailed: "Speed test failed:",
+    speedNote: "Sends 128 MiB and fetches 128 MiB back; nothing is written to disk.",
+    installTitle: "Dump Forge on PS5",
+    ps5Address: "PS5 address",
+    install: "Install on PS5",
+    installHint: "Needs the console's ELF loader listening on the network (port 9021).",
+    findingRelease: "Finding the release on GitHub",
+    installing: (v: string, host: string) => `Installing Dump Forge ${v} on ${host}`,
+    installed: (v: string, host: string) => `Dump Forge ${v} is starting on ${host}. Pair it from Add a device once it runs.`,
+    noRelease: "Can't find Dump Forge's PS5 release on GitHub. Check this computer's internet connection, then try again.",
+    otherPayload: "Any other ELF payload:",
+    sendPayload: "Send a payload",
+    pickPayload: "Choose an ELF payload",
+    sendingPayload: (name: string, host: string) => `Sending ${name} to ${host}`,
+    sentPayload: (name: string, size: string, host: string) => `Sent ${name} (${size}) to ${host}.`,
+    helpInstallTitle: "Install Dump Forge on a PS5 in one click",
+    helpInstallText: "Use the Install Dump Forge card to send the payload to the console. It downloads the matching version from GitHub (or the latest) and starts it.",
+  },
+  // Packages.tsx (Storage's Package installer), InstallDialog.tsx, Files.tsx and Connect.tsx's Install pkg
+  install: {
+    view: "Package installer",
+    packages: "Packages",
+    refresh: "Refresh",
+    scanning: "Looking for packages",
+    none: "No packages found on this console.",
+    noneHint: "Copy a .pkg file to the console's storage or a USB drive, then press Refresh.",
+    truncated: "List may be incomplete",
+    limits: "The search stopped at one of its limits: some packages may be missing.",
+    cantScan: "Can't search:",
+    cantInstall: "Can't install:",
+    content: { game: "Game", patch: "Patch", additional_content: "Additional content", unknown: "Unknown" },
+    install: "Install",
+    installName: (name: string) => `Install ${name}`,
+    started: (name: string) => `Installing ${name}. The job is listed below.`,
+    /** The job row's tag. */
+    tag: "Install",
+    /** The confirm dialog. */
+    title: "Install this package?",
+    titleOn: (device: string) => `Install this package on ${device}?`,
+    file: "File",
+    game: "Game",
+    titleId: "Title ID",
+    version: "Version",
+    size: "Size",
+    text: "The PS5 fetches the package from Dump Forge and installs it. Keep Dump Forge running until the job ends.",
+    reinstall: "If this game is already installed, the PS5 deletes the installed copy before it installs this one.",
+    cancel: "Cancel",
+    confirm: "Install",
+    /** Connect: an online paired PS5's row. */
+    installPkg: "Install pkg",
+    installPkgOn: (device: string) => `Install a package on ${device}`,
+    pickTitle: "Choose a package to install",
+    sent: (device: string) => `${device} is installing the package. The job is listed below.`,
   },
   // api.ts: prettyDuration, whole per language (CJK writes 5分30秒, no spaces)
   duration: { s: (s: number) => `${s} s`, ms: (m: number, s: number) => `${m} min ${s} s`, hm: (h: number, m: number) => `${h} h ${m} min` },

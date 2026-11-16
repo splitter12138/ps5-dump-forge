@@ -781,9 +781,8 @@ fn prepare_with(
     if let Some(entry) = files.iter_mut().find(|f| f.path == PARAM_JSON) {
         entry.size = param_json.len() as u64;
     }
-    if !files.iter().any(|f| f.path == "eboot.bin") {
-        return format_err("the source has no eboot.bin");
-    }
+    // Forge patch 0023: no eboot.bin is additional content or an update; `content_class`
+    // already gives it that class, so it is packaged rather than refused.
     let content_version = source::content_version_word(&param_json).unwrap_or(0);
     check_cancel(control)?;
     // The container's payloads, read once: the streaming arm hands them to the writer,
@@ -1013,8 +1012,9 @@ fn prepare_with(
 
 /// Write the package `prepared` describes into `out`, then verify it.
 ///
-/// `out` is the caller's: created empty and opened for reading **and** writing (a compressed
-/// image is written in place and read back for its digests). `out_path` is where it lives: it
+/// `out` is the caller's: created empty and opened for reading **and** writing (the self-check
+/// reads it back, and so does an encrypted compressed image, transformed after it is written in
+/// place; a plaintext one is digested as it is compressed). `out_path` is where it lives: it
 /// names the package in the report and in errors, and nothing reopens it. Nothing here names,
 /// renames or removes the output: on an error `out` holds a partial package the caller
 /// deletes, and on success it holds the whole package, synced, which the caller publishes.
@@ -1027,18 +1027,22 @@ fn prepare_with(
 pub fn write_package(
     prepared: &Prepared,
     tree: &mut dyn source::SourceTree,
-    out: &mut std::fs::File,
+    out: &mut dyn crate::PkgOut,
     out_path: &Path,
     progress: &mut dyn FnMut(&str),
     control: &mut BuildControl,
 ) -> Result<BuildReport> {
     check_cancel(control)?;
-    if out.metadata()?.len() != 0 {
+    if out.out_len()? != 0 {
         return format_err(format!(
             "{} is not empty; the package is written into a new file",
             out_path.display()
         ));
     }
+    // The header's magic first: an output written once front to back (an FTP upload) can then
+    // take the header, written last, without going back over its first byte.
+    out.write_all(&crate::fih::MAGIC.to_be_bytes())?;
+    out.seek(std::io::SeekFrom::Start(0))?;
     let written = write_mode(
         prepared,
         tree,
@@ -1049,7 +1053,7 @@ pub fn write_package(
         Mode::Streaming,
     )?;
     let report = verify_written(prepared, out, progress, control)?;
-    let size = out.metadata()?.len();
+    let size = out.out_len()?;
     if size != written {
         return format_err(format!(
             "{} is {size} bytes where the writer wrote {written}",
@@ -1098,7 +1102,8 @@ fn build_mode(
         ));
     }
 
-    // Read too: a compressed image is written in place and read back for its digests.
+    // Read too: the self-check reads the package back (and an encrypted image is read back to be
+    // transformed in place).
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1142,12 +1147,12 @@ fn build_mode(
 /// check to pass.
 fn verify_written(
     prepared: &Prepared,
-    out: &std::fs::File,
+    out: &dyn crate::PkgOut,
     progress: &mut dyn FnMut(&str),
     control: &mut BuildControl,
 ) -> Result<crate::verify::Report> {
     enter(control, Stage::Verify);
-    let file = crate::PkgFile::from_reader(Box::new(out.try_clone()?), out.metadata()?.len());
+    let file = crate::PkgFile::from_reader(Box::new(out.try_clone_out()?), out.out_len()?);
     progress("verifying");
     // The streaming verifier reads the package block by block, so the self-check of a
     // 155 GB package does not need 155 GB of memory.
@@ -1176,7 +1181,7 @@ fn verify_written(
 fn write_mode(
     prepared: &Prepared,
     tree: &mut dyn source::SourceTree,
-    out: &mut std::fs::File,
+    out: &mut dyn crate::PkgOut,
     out_path: &Path,
     progress: &mut dyn FnMut(&str),
     control: &mut BuildControl,
@@ -1398,13 +1403,12 @@ fn write_mode(
 
             progress("writing the package");
             {
-                use std::io::{Seek, Write};
                 out.seek(std::io::SeekFrom::Start(0))?;
                 out.write_all(&fih)?;
                 out.write_all(&outer.image)?;
                 out.write_all(&cnt.bytes)?;
                 out.write_all(&si)?;
-                out.sync_all()?;
+                out.sync_out()?;
             }
             cnt_offset + cnt.bytes.len() as u64 + si.len() as u64
         }

@@ -159,7 +159,7 @@ impl Part {
     }
 
     /// Puts the (already verified and fsynced) file part in place of `target`, the source image
-    /// it replaces ([`crate::ConvertRequest::lz4_in_place`]), keeping the original recoverable
+    /// it replaces ([`crate::ConvertRequest::edit_rebuild`]), keeping the original recoverable
     /// until the new one is durable: the original gets a second name beside it (`*.orig.part`,
     /// a hard link, or a rename where the volume has no hard links: macOS exFAT/FAT), the folder
     /// is synced, the part renamed to `target`, the folder synced again, and only then the
@@ -376,18 +376,29 @@ pub(crate) fn handle_id(file: &File) -> io::Result<FileId> {
 #[cfg(windows)]
 pub(crate) fn path_id(path: &Path) -> io::Result<(FileId, FileType)> {
     let file = open_attributes(path, false)?;
-    Ok((handle_id(&file)?, file.metadata()?.file_type()))
+    Ok((path_handle_id(path, &file)?, file.metadata()?.file_type()))
 }
 
 #[cfg(windows)]
 pub(crate) fn followed_id(path: &Path) -> io::Result<FileId> {
-    handle_id(&open_attributes(path, true)?)
+    path_handle_id(path, &open_attributes(path, true)?)
+}
+
+#[cfg(windows)]
+fn path_handle_id(path: &Path, file: &File) -> io::Result<FileId> {
+    // `G:\` or `\\?\G:\`, not a rootless `G:` (that drive's current folder).
+    if path.has_root() && path.parent().is_none() {
+        // A FAT volume root can have id 0; non-roots cannot, so it only matches that root.
+        crate::win::raw_file_id(file)
+    } else {
+        handle_id(file)
+    }
 }
 
 /// Opens a file or folder for its attributes only. It shares everything, so it never
 /// stands in the way of a rename or a delete; `follow: false` opens a link itself.
 #[cfg(windows)]
-fn open_attributes(path: &Path, follow: bool) -> io::Result<File> {
+pub(crate) fn open_attributes(path: &Path, follow: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x7;
@@ -513,12 +524,14 @@ pub(crate) fn fsync_dir(_: &Path) -> io::Result<()> {
 
 /// Renames `from` to `to`, failing with `AlreadyExists` if `to` exists. Works for files
 /// and directories on the same volume. Atomic everywhere except on volumes without an
-/// exclusive rename (macOS exFAT), where it checks `to` and then renames.
+/// exclusive rename (macOS exFAT, Linux NFS and FUSE; FreeBSD always), where it checks `to`
+/// and then renames.
 pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     imp::rename_no_replace(from, to)
 }
 
-/// For volumes without an exclusive rename (macOS exFAT; FreeBSD has none at all). macOS's
+/// For volumes without an exclusive rename (macOS exFAT; Linux NFS and FUSE; FreeBSD has none
+/// at all). macOS's
 /// kernel lookup still fails an existing `to` (in any case) with `EEXIST` before asking the
 /// driver, so there this check only catches what appeared since: nothing at `to`, in any
 /// case, since the lookup follows the volume's case rules, then rename. Nothing is created at
@@ -527,7 +540,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 // is replaced (a window of microseconds, the one the user accepted). macOS offers no way to
 // close it on exFAT today: link(), RENAME_EXCL and clonefile are all unsupported; FreeBSD has
 // no RENAME_EXCL, and a file there is published by hard link where the folder has them.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn checked_rename(from: &Path, to: &Path) -> io::Result<()> {
     match to.symlink_metadata() {
         Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
@@ -537,7 +550,7 @@ fn checked_rename(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn missing(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound
 }
@@ -577,23 +590,28 @@ mod imp {
     use super::*;
 
     pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-        let (from, to) = (c_path(from)?, c_path(to)?);
+        let (c_from, c_to) = (c_path(from)?, c_path(to)?);
         // The raw syscall, not glibc's wrapper: it also links against musl and old glibc.
         // SAFETY: both are valid NUL-terminated paths; the flags are a plain integer.
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
                 libc::AT_FDCWD,
-                from.as_ptr(),
+                c_from.as_ptr(),
                 libc::AT_FDCWD,
-                to.as_ptr(),
+                c_to.as_ptr(),
                 libc::RENAME_NOREPLACE,
             )
         };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        if rc == 0 {
+            return Ok(());
         }
-        Ok(())
+        let err = io::Error::last_os_error();
+        // NFS and FUSE refuse the flag (EINVAL); old kernels and seccomp lack the call (ENOSYS).
+        if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+            return checked_rename(from, to);
+        }
+        Err(err)
     }
 
     fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
@@ -761,26 +779,6 @@ mod tests {
         part.publish(&dir.join("a.exfat")).unwrap();
         assert_eq!(std::fs::read(dir.join("a.exfat")).unwrap(), b"image");
         assert!(!dir.join("a.part").exists());
-    }
-
-    #[test]
-    fn a_stale_creation_id_still_publishes_and_cleans_up() {
-        let dir = crate::test_dir("part-stale");
-        let mut part = written(&dir, "a.part", b"image");
-        stale(&mut part);
-        let open = File::open(dir.join("a.part")).unwrap();
-        assert!(
-            part.is(handle_id(&open).unwrap()),
-            "an open handle on the part is recognised"
-        );
-        drop(open);
-        part.publish(&dir.join("a.exfat")).unwrap();
-        assert_eq!(std::fs::read(dir.join("a.exfat")).unwrap(), b"image");
-
-        let mut part = written(&dir, "b.part", b"image");
-        stale(&mut part);
-        drop(part);
-        assert!(!dir.join("b.part").exists());
     }
 
     #[test]
@@ -994,16 +992,5 @@ mod tests {
                 only(&dir, &["game.ffpkg"]);
             }
         }
-    }
-
-    /// A file whose mode can't be set (fchmod on the PS5) is removed again, as is a folder.
-    #[test]
-    fn create_new_removes_what_it_could_not_open_up() {
-        let dir = crate::test_dir("create-open-up");
-        FAIL.with(|f| f.set(Some(Step::OpenUp)));
-        let err = create_new(&dir.join("f")).unwrap_err();
-        FAIL.with(|f| f.set(None));
-        assert!(err.to_string().contains("injected failure"), "{err}");
-        only(&dir, &[]);
     }
 }

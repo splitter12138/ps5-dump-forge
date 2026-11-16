@@ -542,10 +542,12 @@ fn check_path_table(
             "the flat path table does not match the directory tree ({CONSOLE})"
         ))
     };
-    if !problems.is_empty() || want_resolver.is_some() != resolver.is_some() {
+    // A resolver with no collision left must be empty: an in-place delete (`edit.rs`) keeps
+    // the inode, at size 0, so `uroot` keeps its number.
+    if !problems.is_empty() || (want_resolver.is_some() && resolver.is_none()) {
         return Err(mismatch());
     }
-    let resolver = resolver.zip(want_resolver);
+    let resolver = resolver.map(|n| (n, want_resolver.unwrap_or_default()));
     let nodes = [(fpt, want_fpt, "the flat path table")]
         .into_iter()
         .chain(resolver.map(|(n, want)| (n, want, "the collision resolver")));
@@ -681,6 +683,10 @@ impl Pfsc {
     /// entries and stored bytes read in one pass each, inflated on every core. The last block
     /// is cached for the next read, which usually starts in it.
     fn read_many(&mut self, r: &mut dyn ReadSeek, pos: u64, buf: &mut [u8]) -> Result<usize> {
+        // The rest of a cached block first (the last call's), so it is not inflated again.
+        if self.cache.iter().any(|(b, _)| *b == pos / BLOCK) {
+            return self.read_at(r, pos, buf);
+        }
         // At most MANY_BLOCKS per call (a short read is a read), so memory stays bounded.
         let room = MANY_BLOCKS * BLOCK - pos % BLOCK;
         let want = (buf.len() as u64)

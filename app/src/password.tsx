@@ -1,5 +1,5 @@
 // Reading a source, and the one password question for an archive that needs one (built like
-// the delete question). Inspect, Convert and LZ4 read their source through `inspectSource`; the
+// the delete question). Edit, Convert and Pack read their source through `inspectSource`; the
 // password it returns stays with that source in memory (never stored) and goes with its jobs.
 
 import { useRef, useState } from "react";
@@ -86,6 +86,10 @@ function PasswordDialog(props: {
   const unlock = async () => {
     if (!value || checking) return;
     const password = value;
+    // The prompt again while checking, so a second "not correct" is announced anew; focus to
+    // the input, since the disabled Unlock would drop it to the page (Escape, Tab trap lost).
+    setWrong(false);
+    input.current?.focus();
     setChecking(true);
     try {
       props.onOpened({ ins: await api.inspect(props.path, password), password });

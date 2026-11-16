@@ -37,12 +37,12 @@ struct Want {
 }
 
 type Reply = std::result::Result<Vec<u8>, String>;
-type Job = (Vec<u8>, bool, Want, Encoder, Sender<Reply>);
+type Job = (Vec<u8>, bool, u8, Want, Encoder, Sender<Reply>);
 
 /// One chunk made again and checked against `want`; the stored bytes.
-fn regenerate(raw: Vec<u8>, store: bool, want: Want, encoder: Encoder) -> Reply {
+fn regenerate(raw: Vec<u8>, store: bool, level: u8, want: Want, encoder: Encoder) -> Reply {
     let raw_len = raw.len();
-    let e = encoder(raw, store);
+    let e = encoder(raw, store, level);
     if e.codec != want.codec || e.data.len() != want.stored as usize || e.crc != want.crc {
         return Err(format!(
             "it came out {:?}, {} bytes, CRC {:#010x}; the measure pass recorded {:?}, {} bytes, \
@@ -57,8 +57,8 @@ fn regenerate(raw: Vec<u8>, store: bool, want: Want, encoder: Encoder) -> Reply 
     }
     if e.codec == Codec::Lz4 {
         let mut out = vec![0; raw_len];
-        match lz4_flex::block::decompress_into(&e.data, &mut out) {
-            Ok(n) if n == raw_len && crc32(&out) == want.crc => {}
+        match crate::block::decompress_into(&e.data, &mut out) {
+            Some(n) if n == raw_len && crc32(&out) == want.crc => {}
             _ => return Err("its LZ4 data does not decode to the recorded CRC".into()),
         }
     }
@@ -84,11 +84,11 @@ impl Workers {
                     .spawn(move || {
                         loop {
                             let job = queue.lock().unwrap_or_else(|p| p.into_inner()).recv();
-                            let Ok((raw, store, want, encoder, reply)) = job else {
+                            let Ok((raw, store, level, want, encoder, reply)) = job else {
                                 return;
                             };
                             // The tree may have moved on (a seek); nothing to do then.
-                            let _ = reply.send(regenerate(raw, store, want, encoder));
+                            let _ = reply.send(regenerate(raw, store, level, want, encoder));
                         }
                     })?,
             );
@@ -274,7 +274,7 @@ impl<'a> PackedTree<'a> {
         let (reply, rx) = mpsc::channel();
         let work = self.workers.as_ref().and_then(|w| w.work.as_ref());
         work.expect("started above")
-            .send((raw, spec.store, want, self.encoder, reply))
+            .send((raw, spec.store, self.m.level, want, self.encoder, reply))
             .map_err(|_| bad("a compression worker failed"))?;
         self.pending.push_back((c, rx));
         Ok(())
@@ -461,6 +461,7 @@ mod tests {
             1_700_000_000,
             p,
             3,
+            0,
             &mut |_| {},
             &cancel,
             cap,
@@ -500,14 +501,14 @@ mod tests {
         }
     }
 
-    fn appends_a_byte(raw: Vec<u8>, store: bool) -> crate::writer::Encoded {
-        let mut e = encode(raw, store);
+    fn appends_a_byte(raw: Vec<u8>, store: bool, level: u8) -> crate::writer::Encoded {
+        let mut e = encode(raw, store, level);
         e.data.push(0);
         e
     }
 
-    fn other_codec(raw: Vec<u8>, _: bool) -> crate::writer::Encoded {
-        encode(raw, true)
+    fn other_codec(raw: Vec<u8>, _: bool, level: u8) -> crate::writer::Encoded {
+        encode(raw, true, level)
     }
 
     #[test]

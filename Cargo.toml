@@ -5,13 +5,20 @@ members = [
   "crates/ps5-dump-forge-exfat",
   "crates/ps5-dump-forge-ufs2",
   "crates/ps5-dump-forge-pfs",
+  "crates/ps5-dump-forge-patch",
   "crates/ps5-dump-forge-core",
   "crates/ps5-dump-forge-archive",
   "crates/ps5-dump-forge-cli",
   "crates/ps5-dump-forge-fpkg",
+  "crates/ps5-dump-forge-flink",
   "crates/ps5-dump-forge-lz4",
+  "crates/ps5-dump-forge-zstd",
   "crates/ps5-dump-forge-server",
+  "crates/ps5-dump-forge-smb",
+  "crates/ps5-dump-forge-ftp",
+  "crates/ps5-dump-forge-nfs",
   "crates/ps5-dump-forge-ps5",
+  "crates/ps5-dump-forge-updater",
   "app/src-tauri",
 ]
 # A patched crates.io dependency (see vendor/README.md), not ours to lint or test.
@@ -21,10 +28,11 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "GPL-3.0-or-later"
-version = "0.2.0"
-rust-version = "1.99"
+version = "0.5.5"
+rust-version = "1.100"
 
 [workspace.dependencies]
+aes = "0.9"
 anyhow = "1"
 blake3 = "1"
 getrandom = "0.4"
@@ -38,12 +46,19 @@ ps5upload-pkg = { path = "vendor/ps5upload-pkg" }
 ps5-dump-forge-exfat = { path = "crates/ps5-dump-forge-exfat" }
 ps5-dump-forge-ufs2 = { path = "crates/ps5-dump-forge-ufs2" }
 ps5-dump-forge-pfs = { path = "crates/ps5-dump-forge-pfs" }
+ps5-dump-forge-patch = { path = "crates/ps5-dump-forge-patch" }
 ps5-dump-forge-core = { path = "crates/ps5-dump-forge-core" }
 ps5-dump-forge-ps5 = { path = "crates/ps5-dump-forge-ps5" }
 ps5-dump-forge-archive = { path = "crates/ps5-dump-forge-archive" }
 ps5-dump-forge-fpkg = { path = "crates/ps5-dump-forge-fpkg" }
+ps5-dump-forge-flink = { path = "crates/ps5-dump-forge-flink" }
 ps5-dump-forge-lz4 = { path = "crates/ps5-dump-forge-lz4" }
+ps5-dump-forge-zstd = { path = "crates/ps5-dump-forge-zstd" }
 ps5-dump-forge-server = { path = "crates/ps5-dump-forge-server" }
+ps5-dump-forge-smb = { path = "crates/ps5-dump-forge-smb" }
+ps5-dump-forge-ftp = { path = "crates/ps5-dump-forge-ftp" }
+ps5-dump-forge-nfs = { path = "crates/ps5-dump-forge-nfs" }
+ps5-dump-forge-updater = { path = "crates/ps5-dump-forge-updater" }
 
 [profile.release]
 lto = true

@@ -1,5 +1,5 @@
-// Convert: source → target format → output → Build, then one row per job below the cards.
-// LZ4 asset packs (trace, pack, unpack, the in-place patch) have their own screen (Lz4.tsx).
+// Convert: source → target format → output → Build.
+// LZ4 and zstd packs (pack, unpack) have their own screen (Pack.tsx).
 
 import { useEffect, useRef, useState } from "react";
 
@@ -18,6 +18,7 @@ import {
   classify,
   emulatorNames,
   FormatPicker,
+  isNas,
   isWithin,
   kindLabel,
   onDeleted,
@@ -28,8 +29,7 @@ import {
 import { useMessages } from "./i18n";
 import { Icon } from "./icons";
 import { inspectSource } from "./password";
-import { JobsCard } from "./JobList";
-import type { Action, Job } from "./jobs";
+import { jobType, type Action, type Job } from "./jobs";
 import {
   DEFAULT_FFPFSC_LEVEL,
   FfpfscField,
@@ -38,8 +38,8 @@ import {
   KrakenField,
   Lead,
   OutputField,
-  PkgWarning,
   useOutput,
+  DeleteSourceSwitch,
   VerifySwitch,
 } from "./target";
 
@@ -47,16 +47,22 @@ import {
 const TARGETS: Format[] = ["folder", "pkg", "exfat", "ffpkg", "ffpfsc", "ffpfs"];
 /** The target a new source starts with: fpkg (the debug .pkg), or exfat for a .pkg source. */
 const DEFAULT_FORMAT: Format = "pkg";
+/** Additional content (no eboot.bin): core takes it into a folder or an fpkg only. */
+const AC_TARGETS: Format[] = ["folder", "pkg"];
 const startFormat = (path: string, isImage: boolean): Format =>
   isImage && path.toLowerCase().endsWith(".pkg") ? "exfat" : DEFAULT_FORMAT;
 
 export function Convert(props: {
   jobs: Job[];
+  /** This tab is the one shown: a naming change renames its output only then. */
+  active: boolean;
   dispatch: (a: Action) => void;
   /** Show the "About" tab. */
   onCompare: () => void;
   /** A game the Library opened here; each new `id` is read once. */
   selection?: SourceSelection | null;
+  /** Open this source in the Edit tab (a patch package, which only Edit reads). */
+  onEdit?: (path: string) => void;
 }) {
   const t = useMessages().convert;
   const [source, setSource] = useState<string | null>(null);
@@ -68,11 +74,13 @@ export function Convert(props: {
   const [password, setPassword] = useState<string | null>(null);
   const [format, setFormat] = useState<Format>(DEFAULT_FORMAT);
   /** The image inside a `.ffpfsc`; kept while other targets are picked. */
-  const [inner, setInner] = useState<InnerFormat>("ffpkg");
+  const [inner, setInner] = useState<InnerFormat>("exfat");
   /** Leave the backport libraries out; offered only for a source that has some. */
   const [removeBackport, setRemoveBackport] = useState(false);
   /** Re-read every byte instead of sampling; kept across sources and targets. */
   const [fullVerify, setFullVerify] = useState(false);
+  /** Delete the source once the job is Ok; off by default, kept across sources. */
+  const [deleteSource, setDeleteSource] = useState(false);
   /** The `.fpkg` compression level; kept across sources and targets. */
   const [krakenLevel, setKrakenLevel] = useState<KrakenLevel>("fast");
   /** The `.ffpfsc` zlib level, 0–9; kept across sources and targets. */
@@ -80,11 +88,9 @@ export function Convert(props: {
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // state lags a fast double click
-  /** Jobs this page started: only those scroll into view (not the ones a reload restores). */
-  const started = useRef(new Set<JobId>());
   // Only the latest pick may land (an older inspect can finish last).
   const sourceSeq = useRef(0);
-  const out = useOutput(format, props.jobs, setError);
+  const out = useOutput(format, props.jobs, setError, null, props.active);
   // The target now: one picked while the source was being read is the one to name.
   const formatNow = useRef(format);
   formatNow.current = format;
@@ -97,9 +103,14 @@ export function Convert(props: {
     setRemoveBackport(false);
     setIns(null);
     setPassword(null);
-    setInsError(null);
     setError(null);
     out.reset(path, fmt);
+    await open(path);
+  };
+
+  // Read the source (again for Unlock: the target, backport and a typed name stay as they are).
+  const open = async (path: string) => {
+    setInsError(null);
     setInspecting(true);
     const seq = ++sourceSeq.current;
     try {
@@ -107,6 +118,11 @@ export function Convert(props: {
       if (seq !== sourceSeq.current) return;
       setIns(opened.ins);
       setPassword(opened.password);
+      if (opened.ins.additional_content && !AC_TARGETS.includes(formatNow.current)) {
+        formatNow.current = "pkg";
+        setFormat("pkg");
+        out.retarget(path, "pkg");
+      }
       // A locked archive could not be named before its password.
       if (opened.password !== null) out.opened(path, formatNow.current, opened.password);
     } catch (e) {
@@ -127,7 +143,7 @@ export function Convert(props: {
     void pickRef.current(sel.path, sel.kind !== "folder");
   }, [props.selection]);
 
-  // Inspect or the Library deleted this source (or the folder holding it): forget it, and any late answer.
+  // Edit or the Library deleted this source (or the folder holding it): forget it, and any late answer.
   useEffect(
     () =>
       onDeleted((gone) => {
@@ -144,6 +160,22 @@ export function Convert(props: {
     [source],
   );
 
+  // A job that changed this source in place (an edit) has finished:
+  // read it again. Every job seen unfinished counts, also one started on another tab.
+  const live = useRef(new Set<JobId>());
+  useEffect(() => {
+    let again = false;
+    for (const j of props.jobs) {
+      if (!j.result) {
+        live.current.add(j.id);
+        continue;
+      }
+      if (!live.current.delete(j.id)) continue;
+      if (source !== null && j.request?.source === source && j.request.edits?.length) again = true;
+    }
+    if (again && source !== null) void open(source);
+  }, [props.jobs, source]);
+
   const pickFormat = (fmt: Format) => {
     setFormat(fmt);
     out.retarget(source, fmt);
@@ -154,14 +186,21 @@ export function Convert(props: {
   const libs = ins ? ins.backport.length : 0;
   const emus = ins ? emulatorNames(ins) : [];
 
-  // A packed source (LZ4 asset packs) keeps its packs; core refuses what needs them unpacked
-  // first, which the LZ4 tab does.
+  // A packed source (LZ4 or zstd asset packs) keeps its packs; core refuses what needs them
+  // unpacked first, which the Pack tab does.
   const lz4 = ins?.lz4 ?? null;
-  const lz4Reason = lz4?.packed && removable && removeBackport ? t.lz4Backport : null;
+  const zstdPacked = ins?.zstd_packed === true;
+  const lz4Reason = !(removable && removeBackport)
+    ? null
+    : zstdPacked
+      ? t.zstdBackport
+      : lz4?.packed
+        ? t.lz4Backport
+        : null;
 
   // What core's plain conversion does to an AMPR game by itself (nothing to choose, only said):
   // core's runtime_action installs, replaces or keeps its ampr_emu, and a stale, damaged or
-  // missing ampr_emu.index is written afresh, leaving the old traces out. A package's builder
+  // missing ampr_emu.index is written afresh. A package's builder
   // always writes its own index. A game that doesn't use AMPR gets no note.
   const shipped = lz4?.shipped_runtime_version;
   const action = lz4?.imports_ampr ? lz4.runtime_action : null;
@@ -169,23 +208,35 @@ export function Convert(props: {
   const runtimeNote =
     !action || !shipped
       ? null
-      : t.amprRuntime(action === "replace" && lz4?.runtime === "forge_trace" ? "trace" : action, own, shipped);
+      : zstdPacked
+        ? // A kept zstd runtime is named on the source card's zstd tile.
+          action === "keep"
+          ? null
+          : t.amprZstdRuntime
+        : lz4?.runtime === "zstd"
+          ? // A kept ampr-emu-ng is named on the source card's tile.
+            action === "replace"
+            ? t.amprNgReplaced(shipped)
+            : null
+          : t.amprRuntime(action === "replace" && lz4?.runtime === "forge_trace" ? "trace" : action, own, shipped);
   // Remove backport leaves fakelib files out before core compares the index, so an ok one goes stale.
   const indexState = lz4?.index === "ok" && removable && removeBackport ? "stale" : lz4?.index;
   const indexNote =
-    !lz4?.imports_ampr || lz4.packed
+    !lz4?.imports_ampr || lz4.packed || zstdPacked
       ? null
       : format === "pkg"
-        ? t.amprPkgIndex(lz4.journal_bytes !== null)
+        ? t.amprPkgIndex
         : indexState && indexState !== "ok"
-          ? t.amprIndex(indexState, lz4.journal_bytes !== null)
+          ? t.amprIndex(indexState)
           : null;
 
   // Build would certainly fail: say why next to it instead.
   const hard = ins ? ins.findings.filter((l) => classify(l).kind === "block") : [];
   const blockReason = insError
     ? t.unreadable
-    : hard.length > 0
+    : ins?.patch
+      ? t.patchBlocked
+      : hard.length > 0
       ? t.blocked(hard[0], hard.length - 1)
       : format === "pkg" && ins && !ins.content_id
         ? t.noContentId
@@ -203,24 +254,27 @@ export function Convert(props: {
       inner: format === "ffpfsc" ? inner : null,
       remove_backport: removable && removeBackport,
       full_verify: fullVerify,
+      // A NAS's game can't be deleted from here; a patch can't be converted at all.
+      ...(deleteSource && !isNas(source) && { delete_source: true }),
       kraken_level: krakenLevel,
       ffpfsc_level: ffpfscLevel,
-      // LZ4 tracing, packing and unpatching start from the LZ4 tab.
+      // LZ4 and zstd packing and unpacking start from the Pack tab.
       lz4: null,
       ...(password !== null && { archive_password: password }),
     };
     submittingRef.current = true;
     setSubmitting(true);
     const choice = out.choiceSeq.current;
+    const seq = sourceSeq.current;
     try {
       const id = await api.startJob(request);
-      started.current.add(id);
       props.dispatch({ type: "started", id, request });
       out.next(source, request.output, choice);
       // A double click's second press lands once the job started: the button rests a moment.
       await new Promise((r) => setTimeout(r, 1000));
     } catch (e) {
-      setError(errorText(e));
+      // Not under a source picked since.
+      if (seq === sourceSeq.current) setError(errorText(e));
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
@@ -228,7 +282,7 @@ export function Convert(props: {
   };
 
   const sameJobs = props.jobs.filter(
-    (j) => !j.result && j.request?.source === source && j.request.format === format,
+    (j) => !j.result && j.request?.source === source && j.request.format === format && jobType(j.request) === "convert",
   );
   // A typed name that an unfinished job is writing can't be used twice; a generated one
   // moves on to the next free name, so another Build is a second copy.
@@ -238,14 +292,13 @@ export function Convert(props: {
   const formatWarn = ins
     ? ins.findings.filter((l) => classify(l).formats?.includes(format)).length
     : 0;
-  const hasJobs = props.jobs.length > 0;
   // An unreadable source fails its naming too: Source already says why.
   const shownError = insError ? null : error;
   // What to expect for an AMPR game, unless Build is off anyway.
   const ampr = !blockReason && (runtimeNote !== null || indexNote !== null);
 
   return (
-    <div className={hasJobs ? "screen with-jobs" : "screen"}>
+    <div className="screen">
       <div className="cols">
         <SourceCard
           path={source}
@@ -253,24 +306,28 @@ export function Convert(props: {
           busy={inspecting}
           error={insError}
           ins={ins}
-          onUnlock={() => source && void pickSource(source, sourceIsImage)}
+          onUnlock={() => source && void open(source)}
         />
 
         <section className="card" aria-labelledby="c-target">
-          <CardHead icon="target" title={t.target} id="c-target" />
+          <CardHead icon="target" title={t.target} id="c-target">
+            <button type="button" className="small" onClick={props.onCompare}>
+              <Icon name="table" />
+              {t.compare}
+            </button>
+          </CardHead>
           <FormatPicker
             name="target-format"
             label={t.targetFormat}
             value={format}
             onChange={pickFormat}
-            formats={TARGETS}
+            formats={ins?.additional_content ? AC_TARGETS : TARGETS}
             disabled={(f) => f === "folder" && source !== null && !sourceIsImage}
             reason={(f) => (f === "folder" ? t.alreadyFolder : undefined)}
           />
           <p className="muted desc">
             <Lead note={formatInfo(format)} />
           </p>
-          {format === "pkg" && <PkgWarning />}
           {format === "ffpfsc" && (
             <FfpfscField
               prefix="c"
@@ -310,10 +367,7 @@ export function Convert(props: {
           )}
           {format === "pkg" && <KrakenField prefix="c" value={krakenLevel} onChange={setKrakenLevel} />}
           <VerifySwitch checked={fullVerify} onChange={setFullVerify} />
-          <button className="link" onClick={props.onCompare}>
-            <Icon name="table" />
-            {t.compare}
-          </button>
+          {!ins?.patch && <DeleteSourceSwitch checked={deleteSource} onChange={setDeleteSource} nas={isNas(source)} />}
           <OutputField out={out} source={source} prefix="c" />
           <div className="build-row">
             <GenerateSwitch out={out} source={source} />
@@ -326,9 +380,13 @@ export function Convert(props: {
               {t.build}
             </button>
           </div>
-          {(blockReason || formatWarn > 0 || dupe || shownError || ampr) && (
+          {(blockReason || formatWarn > 0 || dupe || collides || shownError || ampr) && (
             <div className="build-notes">
-              {shownError && <p className="bad">{shownError}</p>}
+              {shownError && (
+                <p className="bad" role="alert">
+                  {shownError}
+                </p>
+              )}
               {blockReason && (
                 <p className="note-line block">
                   <Icon name="alert" />
@@ -336,6 +394,12 @@ export function Convert(props: {
                     <Prose text={blockReason} />
                   </span>
                 </p>
+              )}
+              {ins?.patch && source && props.onEdit && (
+                <button type="button" className="small" onClick={() => props.onEdit?.(source)}>
+                  <Icon name="pencil" />
+                  {t.openInEdit}
+                </button>
               )}
               {!blockReason && formatWarn > 0 && (
                 <p className="note-line warn">
@@ -355,7 +419,7 @@ export function Convert(props: {
                   <span>{indexNote}</span>
                 </p>
               )}
-              {dupe && (
+              {(dupe || collides) && (
                 <p className="note-line muted">
                   <Icon name="info" />
                   <span>
@@ -368,7 +432,6 @@ export function Convert(props: {
         </section>
       </div>
 
-      {hasJobs && <JobsCard jobs={props.jobs} dispatch={props.dispatch} started={started} prefix="c" />}
     </div>
   );
 }

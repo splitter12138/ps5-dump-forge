@@ -1,11 +1,14 @@
-//! Which files go into the packs, and how: the TOML profile subset, trace-observed files and the
-//! built-in fallback, behind one `select`. Globs follow Python's `fnmatchcase` (as upstream
-//! `ampr_pack.py`'s profiles do): `*` crosses `/`, case-sensitive, whole-path match.
+//! The packing strategy, shared by zstd and LZ4 Pack (the pack format is a separate choice):
+//! which files go into the packs, and how. The built-in packing strategy (the keep-loose list
+//! and every root file stay loose), or a TOML profile of it (upstream `ampr_pack.py`'s format, as
+//! the Lazy_AMPR community profiles write it), then, for LZ4 only, auto-loose over the large files
+//! left. Globs follow Python's `fnmatchcase`: `*` crosses `/`, case-sensitive, whole-path match.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::collections::HashMap;
 
-use crate::{PackSpec, RuntimeProfile};
+use toml::{Table, Value};
+
+use crate::PackSpec;
 
 // ---- glob ---------------------------------------------------------------------------------------
 
@@ -70,6 +73,7 @@ fn compile(pat: &[char]) -> Vec<Tok> {
             c => out.push(Tok::Lit(c)),
         }
     }
+    out.shrink_to_fit(); // held for the whole job, one per pattern
     out
 }
 
@@ -239,18 +243,23 @@ fn has_suffix(path: &str, suffixes: &[&str]) -> bool {
 
 fn artifact(path: &str) -> bool {
     use crate::{CRC_SIDECAR, INDEX, JOURNAL, LOGS, MANIFEST, PROFILE, RUNTIME};
-    [MANIFEST, CRC_SIDECAR, PROFILE, INDEX, RUNTIME, JOURNAL].contains(&path)
-        || LOGS.contains(&path)
+    // ASCII case-insensitive, as `always_loose`: an image folds case.
+    ([MANIFEST, CRC_SIDECAR, PROFILE, INDEX, RUNTIME, JOURNAL].iter())
+        .chain(LOGS.iter())
+        .any(|name| name.eq_ignore_ascii_case(path))
 }
 
-/// Paths that stay loose whatever a profile or a trace says: they are loaded by the console or the
-/// runtime before (or outside) the pack layer. `path` is relative with `/` separators.
+/// Paths that are never packed: they are loaded by the console or the
+/// runtime before (or outside) the pack layer, and `*.ini` (`dlc_emu.ini` and other settings
+/// a user edits by hand).  `path` is relative with `/` separators.
+/// Names compare ASCII case-insensitively: exFAT and PFS images fold case, so `SCE_SYS/x` is
+/// the folder the console reads.
 pub fn always_loose(path: &str) -> bool {
     let file = path.rsplit('/').next().unwrap_or(path);
-    let first = path.split('/').next().unwrap_or("");
+    let first = path.split('/').next().unwrap_or("").to_ascii_lowercase();
     let in_dir = path.contains('/');
-    file == "eboot.bin"
-        || has_suffix(path, &[".elf", ".self", ".prx", ".sprx"])
+    file.eq_ignore_ascii_case("eboot.bin")
+        || has_suffix(path, &[".elf", ".self", ".prx", ".sprx", ".ini"])
         || (in_dir && (first == "sce_sys" || first == "sce_module" || first.starts_with("fakelib")))
         || artifact(path)
 }
@@ -326,7 +335,8 @@ const FALLBACK_SUFFIXES: &[&str] = &[
     ".upluginmanifest", // Unreal reads these at boot
 ];
 
-/// Directory families that are loose at any depth, and the two that are only loose at the root.
+/// Directory families that are loose at any depth (`fakelib*` by prefix), and the two that are only
+/// loose at the root; every folder name compares ASCII case-insensitively.
 const PROTECTED_DIRS: &[&str] = &[
     "sce_module",
     "sce_sys",
@@ -338,21 +348,89 @@ const PROTECTED_DIRS: &[&str] = &[
     "uds",
 ];
 const ROOT_ONLY_DIRS: &[&str] = &["decrypted", "_DUPLEX_"];
+/// Video folders, loose at any depth, ASCII case-insensitive (not `cinematic*`: Miles Morales
+/// packs `d/cinematic2`, an animation file).
+const VIDEO_DIRS: &[&str] = &[
+    "video",
+    "videos",
+    "movie",
+    "movies",
+    "cutscene",
+    "cutscenes",
+    "fmv",
+];
+/// Insomniac's extensionless boot and streaming containers, matched (lower-cased) on a file's
+/// name at any depth.
+const LOOSE_NAMES: &[&str] = &[
+    "bootload_*",
+    "critbootload",
+    "soundbank",
+    "soundbank.*",
+    "soundbank_*",
+    "wem",
+    "wem.*",
+    "wem_*",
+    "screenreaderwem*",
+    "movie",
+    "movie_*",
+    "movies",
+    "movies_*",
+];
 
-/// The keep-loose list, for every rule source (a profile included): what an engine may open,
-/// stat or list before the game initializes AMPR, when packed files do not exist yet (container
-/// indexes, configs, media, the protected directory families).
-pub fn keep_loose(path: &str) -> bool {
-    if has_suffix(path, FALLBACK_SUFFIXES) {
-        return true;
-    }
-    let dirs: Vec<&str> = path.split('/').collect();
-    let dirs = &dirs[..dirs.len() - 1];
-    dirs.iter().any(|d| PROTECTED_DIRS.contains(d))
-        || dirs.first().is_some_and(|d| ROOT_ONLY_DIRS.contains(d))
+/// Why the built-in packing strategy keeps a non-empty file loose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loose {
+    /// A root file.
+    Root,
+    /// A keep-loose suffix (the suffix as listed, lower case).
+    Suffix(&'static str),
+    /// A system or runtime file, a protected or video folder, or a container name.
+    Protected,
 }
 
-/// The built-in guess's loose set: the keep-loose list and every root file.
+fn protected(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    let (name, dirs) = parts.split_last().unwrap_or((&"", &[]));
+    let name = name.to_ascii_lowercase();
+    let is = |d: &str, list: &[&str]| list.iter().any(|v| d.eq_ignore_ascii_case(v));
+    dirs.iter().any(|d| {
+        is(d, PROTECTED_DIRS)
+            || is(d, VIDEO_DIRS)
+            || d.get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("fakelib"))
+    }) || dirs.first().is_some_and(|d| is(d, ROOT_ONLY_DIRS))
+        || LOOSE_NAMES.iter().any(|p| glob_match(p, &name))
+}
+
+fn suffix(path: &str) -> Option<&'static str> {
+    FALLBACK_SUFFIXES
+        .iter()
+        .copied()
+        .find(|s| has_suffix(path, &[s]))
+}
+
+/// The keep-loose list: anything the game reads other than through AMPR (plain reads, mmap),
+/// before or after it initializes AMPR (container indexes, configs, media, the protected
+/// directory families, video folders, Insomniac's boot and streaming containers).
+pub fn keep_loose(path: &str) -> bool {
+    suffix(path).is_some() || protected(path)
+}
+
+/// Why the built-in packing strategy keeps `path` loose, `None` when it packs it (an empty file
+/// is loose too, whatever this says).
+pub fn loose_reason(path: &str) -> Option<Loose> {
+    if !path.contains('/') {
+        Some(Loose::Root)
+    } else if always_loose(path) {
+        Some(Loose::Protected)
+    } else if let Some(s) = suffix(path) {
+        Some(Loose::Suffix(s))
+    } else {
+        protected(path).then_some(Loose::Protected)
+    }
+}
+
+/// The built-in packing strategy's loose set: the keep-loose list and every root file.
 fn fallback_loose(path: &str) -> bool {
     !path.contains('/') || keep_loose(path)
 }
@@ -395,23 +473,15 @@ pub struct Rule {
     pub hot: bool,
 }
 
-impl Rule {
-    #[cfg(test)]
-    fn matches(&self, path: &str) -> bool {
-        self.include.iter().any(|p| glob_match(p, path))
-            && !self.exclude.iter().any(|p| glob_match(p, path))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
     pub default_action: Action,
     pub default_block_shift: u8,
     /// Private, so `compiled` always matches it: read through [`Profile::rules`].
     rules: Vec<Rule>,
-    pub runtime: Option<RuntimeProfile>,
     pub auto_loose: AutoLoose,
-    /// Known keys that are accepted and have no effect here, as `scope.key`, for the job log.
+    /// Keys that have no effect here, as `scope.key` (`table.*` for a whole table), for the
+    /// job log.
     pub ignored: Vec<String>,
     compiled: Compiled,
 }
@@ -431,8 +501,10 @@ impl Profile {
 struct Compiled {
     /// Per rule: its include patterns that are not one exact path.
     globs: Vec<Vec<Vec<Tok>>>,
-    /// Per rule: its exclude patterns.
+    /// Per rule: its exclude patterns that are not one exact path.
     excludes: Vec<Vec<Vec<Tok>>>,
+    /// Normalized exact path -> the rules with an exclude naming exactly it.
+    exact_excludes: HashMap<String, Vec<usize>>,
     /// The rules with any `globs`, ascending.
     globbed: Vec<usize>,
     /// Normalized exact path -> the rules (ascending) with an include naming exactly it.
@@ -487,8 +559,15 @@ impl Compiled {
                 c.globbed.push(i);
             }
             c.globs.push(globs);
-            c.excludes
-                .push(r.exclude.iter().map(|p| compile(&norm(p))).collect());
+            let mut excludes = Vec::new();
+            for p in &r.exclude {
+                let toks = compile(&norm(p));
+                match literal(&toks) {
+                    Some(path) => c.exact_excludes.entry(path).or_default().push(i),
+                    None => excludes.push(toks),
+                }
+            }
+            c.excludes.push(excludes);
         }
         c
     }
@@ -498,47 +577,52 @@ impl Compiled {
         let s = norm(path);
         let hit = |ps: &[Vec<Tok>]| ps.iter().any(|t| glob_match_compiled(t, &s));
         let key: String = s.iter().collect();
+        let out = self.exact_excludes.get(&key);
+        let excluded = |r: usize| hit(&self.excludes[r]) || out.is_some_and(|rs| rs.contains(&r));
         let exact = self
             .exact
             .get(&key)
-            .and_then(|rs| rs.iter().rev().copied().find(|&r| !hit(&self.excludes[r])));
+            .and_then(|rs| rs.iter().rev().copied().find(|&r| !excluded(r)));
         // A later rule can only beat it through a glob include.
         self.globbed
             .iter()
             .rev()
             .copied()
             .take_while(|&r| exact.is_none_or(|e| r > e))
-            .find(|&r| hit(&self.globs[r]) && !hit(&self.excludes[r]))
+            .find(|&r| hit(&self.globs[r]) && !excluded(r))
             .or(exact)
     }
 }
-
-/// Where the choices come from, in the order the caller prefers: an explicit profile, this dump's
-/// traces (relative paths of the files the game read), the built-in table.
-pub enum Selection<'a> {
-    Profile(&'a Profile),
-    Observed(&'a BTreeSet<String>),
-    Fallback,
-}
-
-/// `None` keeps the file loose. Empty files and `always_loose` paths are loose before anything else.
-pub fn select(path: &str, size: u64, sel: &Selection) -> Option<PackSpec> {
+/// `None` keeps the file loose. Empty files and `always_loose` paths are loose before anything
+/// else. Without a profile, the compatibility LZ4 strategy (LZ4 Pack with upstream ampr_emu, which
+/// serves only AMPR reads, by user decision): the keep-loose list and root files
+/// stay loose, everything else is packed with 64 KiB blocks. With one, its rules decide
+/// ([`profile_spec`]): the keep-loose list doesn't apply and root files are the profile's call.
+pub fn select(path: &str, size: u64, profile: Option<&Profile>) -> Option<PackSpec> {
     if size == 0 || always_loose(path) {
         return None;
     }
-    match sel {
-        // Traces only narrow the built-in guess: the engine opens containers' indexes, configs and
-        // media with plain file I/O at boot, so an observed file the fallback keeps loose stays loose.
-        Selection::Observed(set) => (set.contains(path) && !fallback_loose(path)).then(plain_spec),
-        Selection::Fallback => (!fallback_loose(path)).then(plain_spec),
-        // A profile cannot pack what the keep-loose list keeps (Lazy_AMPR forces its exclusions on
-        // custom profiles too); root files are the profile's call.
-        Selection::Profile(p) => profile_spec(path, p).filter(|_| !keep_loose(path)),
+    match profile {
+        None => (!fallback_loose(path)).then(plain_spec),
+        // A profile is the user's call: only `always_loose` (system and runtime files) wins.
+        Some(p) => profile_spec(path, p),
+    }
+}
+
+/// Pack everything except system files (by user decision: zstd Pack, and LZ4 Pack with
+/// ampr-emu-ng): without a profile every non-empty file is packed except `always_loose`
+/// (executables, `sce_sys`, `sce_module`, `fakelib*`, `.ini` files, the runtime's own files): ampr-emu-ng serves
+/// a fully packed game (plain and libc I/O, directory listings, mmap), so media, configs and root
+/// files go into the packs too. A profile decides as in [`select`].
+pub fn select_everything(path: &str, size: u64, profile: Option<&Profile>) -> Option<PackSpec> {
+    match profile {
+        None => (size > 0 && !always_loose(path)).then(plain_spec),
+        Some(_) => select(path, size, profile),
     }
 }
 
 /// What `p`'s own rules choose for a non-empty, not `always_loose` file: its last matching rule,
-/// else the profile default. [`select`] then applies the keep-loose list.
+/// else the profile default.
 pub fn profile_spec(path: &str, p: &Profile) -> Option<PackSpec> {
     let rule = p.compiled.last_match(path).map(|i| &p.rules[i]);
     let (action, block_shift, layout, hot) = match rule {
@@ -656,8 +740,6 @@ impl AutoLoose {
 
 // ---- TOML profile -------------------------------------------------------------------------------
 
-use toml::{Table, Value};
-
 const PACK_KEYS: &[&str] = &[
     "default_action",
     "default_block_size",
@@ -671,35 +753,6 @@ const PACK_KEYS: &[&str] = &[
     "auto_loose_min_savings_ratio",
     "auto_loose_max_raw_ratio",
 ];
-const PACK_IGNORED: &[&str] = &[
-    "pack_pattern",
-    "payload_alignment",
-    "chunk_alignment",
-    "workers",
-    "compression_mode",
-    "compression_level",
-    "acceleration",
-    "min_savings_bytes",
-    "min_savings_ratio",
-    "io_neutral_min_savings_bytes",
-    "io_neutral_min_savings_ratio",
-    "deduplicate",
-    "deduplicate_scope",
-    "deduplicate_streaming",
-    "preserve_mtime",
-    "validate_index_metadata",
-    "self_contained",
-    "required_packed",
-];
-const GROUP_IGNORED: &[&str] = &[
-    "pack_count",
-    "assignment",
-    "max_pack_size",
-    "stripe_large_files",
-    "stripe_threshold",
-    "stripe_group_blocks",
-    "io_page_size",
-];
 const RULE_KEYS: &[&str] = &[
     "action",
     "include",
@@ -710,32 +763,23 @@ const RULE_KEYS: &[&str] = &[
     "layout",
     "hot",
 ];
-const RULE_IGNORED: &[&str] = &[
-    "group",
-    "compression_mode",
-    "compression_level",
-    "acceleration",
-    "min_savings_bytes",
-    "min_savings_ratio",
-    "io_neutral_min_savings_bytes",
-    "io_neutral_min_savings_ratio",
-    "streaming",
-    "force_pack",
-];
-const RUNTIME_KEYS: &[&str] = &[
-    "decoded_cache_bytes",
-    "physical_cache_bytes",
-    "workers",
-    "latency_reserve_workers",
-];
-
 const DEFAULT_INDEX_NAME: &str = "ampr_assets.index";
 const IO_PAGE: u64 = 65536;
 
+/// Patterns all of a profile's pattern files may hold: a game's file count (the Library's
+/// 200,000 entries), for lists of exact paths, which are looked up in a map.
+const MAX_FILE_PATTERNS: usize = 200_000;
+/// Of those, the ones with a wildcard: each is compiled (32 bytes per character) and tried
+/// against every file, so they bound the job's memory and time.
+// ponytail: 10,000 globs; a pattern index (by literal prefix) would allow more.
+const MAX_FILE_GLOBS: usize = 10_000;
+
 struct Ctx {
-    dir: std::path::PathBuf,
     errs: Vec<String>,
     ignored: Vec<String>,
+    /// Patterns read from pattern files so far, and those with a wildcard.
+    from_files: usize,
+    globs_from_files: usize,
 }
 
 impl Ctx {
@@ -749,15 +793,11 @@ impl Ctx {
         }
     }
 
-    /// Unknown keys are findings, known-ignored ones go to the log list.
-    fn keys(&mut self, scope: &str, t: &Table, honored: &[&str], ignored: &[&str]) {
-        for k in t.keys() {
-            if honored.contains(&k.as_str()) {
-            } else if ignored.contains(&k.as_str()) {
-                self.note(format!("{scope}.{k}"));
-            } else {
-                self.err(format!("unknown key `{scope}.{k}`"));
-            }
+    /// Keys Forge has no use for (upstream's tuning, typos) go to the log list, not refused,
+    /// so community profiles load.
+    fn keys(&mut self, scope: &str, t: &Table, honored: &[&str]) {
+        for k in t.keys().filter(|k| !honored.contains(&k.as_str())) {
+            self.note(format!("{scope}.{k}"));
         }
     }
 
@@ -863,50 +903,83 @@ impl Ctx {
         }
         r
     }
+}
 
-    /// Pattern lines of a file that must resolve inside the TOML's own directory.
-    fn pattern_file(&mut self, key: &str, name: &str) -> Vec<String> {
-        let rel = Path::new(name);
-        if rel.is_absolute() || name.starts_with(['/', '\\']) {
-            self.err(format!("`{key}`: `{name}` must be relative to the profile"));
-            return Vec::new();
+/// A pattern file's loader: its name as the profile wrote it -> its text, or why not.
+type ReadPatterns<'a> = dyn FnMut(&str) -> Result<String, String> + 'a;
+
+/// The patterns of a rule's `include_from` / `exclude_from` files, as upstream `ampr_pack.py`
+/// reads them: names relative to the profile's folder (absolute or escaping refused), one
+/// pattern per line, trimmed, blank lines and `#` comments skipped.
+fn pattern_files(c: &mut Ctx, t: &Table, key: &str, read: &mut ReadPatterns) -> Vec<String> {
+    let Some(v) = t.get(key) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in c.strings(&format!("rule.{key}"), v).unwrap_or_default() {
+        let inside = !name.is_empty()
+            && !name.contains(['\\', ':'])
+            && !name.starts_with('/')
+            && name.split('/').all(|p| !["", ".", ".."].contains(&p));
+        if !inside {
+            c.err(format!(
+                "`rule.{key}` entry {name:?} must be a path inside the profile's folder \
+                 (`/`-separated, no `.`, `..`, `\\` or `:`)"
+            ));
+            continue;
         }
-        let root = match self.dir.canonicalize() {
-            Ok(r) => r,
-            Err(e) => {
-                self.err(format!("`{key}`: profile folder: {e}"));
-                return Vec::new();
-            }
-        };
-        let full = match root.join(rel).canonicalize() {
-            Ok(f) => f,
-            Err(e) => {
-                self.err(format!("`{key}`: `{name}`: {e}"));
-                return Vec::new();
-            }
-        };
-        if !full.starts_with(&root) {
-            self.err(format!("`{key}`: `{name}` leaves the profile's folder"));
-            return Vec::new();
+        if c.from_files > MAX_FILE_PATTERNS {
+            return out;
         }
-        match std::fs::read_to_string(&full) {
-            Ok(s) => s
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(str::to_owned)
-                .collect(),
-            Err(e) => {
-                self.err(format!("`{key}`: `{name}`: {e}"));
-                Vec::new()
+        match read(&name) {
+            Err(e) => c.err(format!("`rule.{key}` file {name}: {e}")),
+            Ok(text) => {
+                // Python's `splitlines`, as upstream: a lone `\r` ends a line too.
+                let lines = text.split(|ch| {
+                    matches!(
+                        ch,
+                        '\n' | '\r' | '\x0b' | '\x0c' | '\x1c'
+                            ..='\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}'
+                    )
+                });
+                for l in lines.map(str::trim) {
+                    if l.is_empty() || l.starts_with('#') {
+                        continue;
+                    }
+                    let glob = literal(&compile(&norm(l))).is_none();
+                    let over = if c.from_files == MAX_FILE_PATTERNS {
+                        Some(format!("more than {MAX_FILE_PATTERNS} patterns"))
+                    } else if glob && c.globs_from_files == MAX_FILE_GLOBS {
+                        Some(format!(
+                            "more than {MAX_FILE_GLOBS} patterns with a wildcard"
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(over) = over {
+                        c.err(format!("pattern files: {over} in all"));
+                        c.from_files = MAX_FILE_PATTERNS + 1; // past a cap: no file is read again
+                        return out;
+                    }
+                    c.from_files += 1;
+                    c.globs_from_files += usize::from(glob);
+                    out.push(l.to_owned());
+                }
             }
         }
     }
+    out
 }
 
-fn parse_rule(c: &mut Ctx, n: usize, v: &Value, default_shift: u8) -> Option<Rule> {
+fn parse_rule(
+    c: &mut Ctx,
+    n: usize,
+    v: &Value,
+    default_shift: u8,
+    read: &mut ReadPatterns,
+) -> Option<Rule> {
     let t = c.table(&format!("rule[{n}]"), v)?;
-    c.keys("rule", t, RULE_KEYS, RULE_IGNORED);
+    c.keys("rule", t, RULE_KEYS);
     let before = c.errs.len();
     let mut r = Rule {
         action: Action::Compress,
@@ -931,91 +1004,25 @@ fn parse_rule(c: &mut Ctx, n: usize, v: &Value, default_shift: u8) -> Option<Rul
             None => c.err("`rule.hot` must be a boolean".into()),
         }
     }
-    let lists = |c: &mut Ctx, key: &str, from: &str| {
-        let mut out = Vec::new();
-        if let Some(v) = t.get(key) {
-            out.extend(c.strings(&format!("rule.{key}"), v).unwrap_or_default());
-        }
-        let mut loaded = Vec::new();
-        if let Some(v) = t.get(from) {
-            for f in c.strings(&format!("rule.{from}"), v).unwrap_or_default() {
-                loaded.extend(c.pattern_file(&format!("rule.{from}"), &f));
-            }
-        }
-        (out, loaded, t.contains_key(key))
+    let list = |c: &mut Ctx, key: &str| match t.get(key) {
+        Some(v) => c.strings(&format!("rule.{key}"), v).unwrap_or_default(),
+        None => Vec::new(),
     };
-    let (inc, inc_loaded, inc_given) = lists(c, "include", "include_from");
-    let (exc, exc_loaded, _) = lists(c, "exclude", "exclude_from");
-    r.include = inc;
-    if !inc_given && inc_loaded.is_empty() {
-        r.include.push("**".into());
-    }
-    r.include.extend(inc_loaded);
-    r.exclude = exc;
-    r.exclude.extend(exc_loaded);
+    let include_from = pattern_files(c, t, "include_from", read);
+    let exclude_from = pattern_files(c, t, "exclude_from", read);
+    r.include = match (t.contains_key("include"), include_from.is_empty()) {
+        (true, _) => list(c, "include"),
+        // upstream: the default `**` only when the pattern files gave no pattern
+        (false, true) => vec!["**".into()],
+        (false, false) => Vec::new(),
+    };
+    r.exclude = list(c, "exclude");
+    r.include.extend(include_from);
+    r.exclude.extend(exclude_from);
     if r.include.is_empty() && c.errs.len() == before {
         c.err(format!("rule[{n}] has no include patterns"));
     }
     (c.errs.len() == before).then_some(r)
-}
-
-fn parse_runtime(c: &mut Ctx, v: &Value) -> Option<RuntimeProfile> {
-    let t = c.table("runtime", v)?;
-    c.keys("runtime", t, RUNTIME_KEYS, &[]);
-    let before = c.errs.len();
-    let get = |c: &mut Ctx, k: &str| -> Option<&Value> {
-        let v = t.get(k);
-        if v.is_none() {
-            c.err(format!("`runtime.{k}` is required"));
-        }
-        v
-    };
-    let cache = |c: &mut Ctx, k: &str| {
-        let v = get(c, k)?;
-        let n = c.size(&format!("runtime.{k}"), v)?;
-        if n % 16384 != 0 {
-            c.err(format!(
-                "`runtime.{k}` must be a multiple of 16384, got {n}"
-            ));
-            return None;
-        }
-        Some(n)
-    };
-    let decoded = cache(c, "decoded_cache_bytes");
-    let physical = cache(c, "physical_cache_bytes");
-    let int = |c: &mut Ctx, k: &str| {
-        let v = get(c, k)?;
-        let n = v.as_integer().and_then(|i| u32::try_from(i).ok());
-        if n.is_none() {
-            c.err(format!("`runtime.{k}` must be a non-negative integer"));
-        }
-        n
-    };
-    let workers = int(c, "workers");
-    let reserve = int(c, "latency_reserve_workers");
-    if let Some(w) = workers
-        && !(1..=16).contains(&w)
-    {
-        c.err(format!("`runtime.workers` must be 1..16, got {w}"));
-    }
-    if let (Some(w), Some(r)) = (workers, reserve)
-        && (1..=16).contains(&w)
-        && r >= w
-    {
-        c.err(format!(
-            "`runtime.latency_reserve_workers` must be 0..{}, got {r}",
-            w - 1
-        ));
-    }
-    if c.errs.len() != before {
-        return None;
-    }
-    Some(RuntimeProfile {
-        decoded_cache_bytes: decoded?,
-        physical_cache_bytes: physical?,
-        workers: workers?,
-        latency_reserve_workers: reserve?,
-    })
 }
 
 /// The `[pack] auto_loose_*` keys over upstream's defaults, with upstream's bounds.
@@ -1057,43 +1064,40 @@ fn parse_auto_loose(c: &mut Ctx, t: &Table, a: &mut AutoLoose) {
     }
 }
 
-/// Parses and validates a profile; every problem is a finding. Pattern files resolve against the
-/// TOML's own folder and may not leave it.
-pub fn load_profile(path: &Path) -> Result<Profile, Vec<String>> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| vec![format!("profile {}: {e}", path.display())])?;
-    let root: Table = text
-        .parse()
-        .map_err(|e| vec![format!("profile {}: {e}", path.display())])?;
-    // Through a symlink, pattern files sit next to the real TOML.
-    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let dir = real
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+/// Parses and validates a profile's text; every problem is a finding. Keys and tables Forge has
+/// no use for (`[groups]`, `[runtime]`, upstream's tuning, typos) are listed in
+/// [`Profile::ignored`], not refused. `read` loads a rule's `include_from` / `exclude_from`
+/// file: it gets the name exactly as the profile wrote it, already checked to be a relative
+/// `/`-separated path inside the profile's folder, and returns the file's text or an error.
+pub fn parse_profile(
+    text: &str,
+    read: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<Profile, Vec<String>> {
+    let root: Table = text.parse().map_err(|e| vec![format!("{e}")])?;
     let mut c = Ctx {
-        dir: dir.to_path_buf(),
         errs: Vec::new(),
         ignored: Vec::new(),
+        from_files: 0,
+        globs_from_files: 0,
     };
     let mut p = Profile {
         default_action: Action::Loose,
         default_block_shift: SHIFT_64K,
         rules: Vec::new(),
-        runtime: None,
         auto_loose: AutoLoose::default(),
         ignored: Vec::new(),
         compiled: Compiled::default(),
     };
-    for k in root.keys() {
-        if !["pack", "rule", "runtime", "groups"].contains(&k.as_str()) {
-            c.err(format!("unknown key `{k}`"));
-        }
+    for k in root
+        .keys()
+        .filter(|k| !["pack", "rule"].contains(&k.as_str()))
+    {
+        c.note(format!("{k}.*"));
     }
     if let Some(v) = root.get("pack")
         && let Some(t) = c.table("pack", v)
     {
-        c.keys("pack", t, PACK_KEYS, PACK_IGNORED);
+        c.keys("pack", t, PACK_KEYS);
         if let Some(v) = t.get("default_action") {
             p.default_action = c
                 .action("pack.default_action", v)
@@ -1118,27 +1122,15 @@ pub fn load_profile(path: &Path) -> Result<Profile, Vec<String>> {
         }
         parse_auto_loose(&mut c, t, &mut p.auto_loose);
     }
-    if let Some(v) = root.get("groups")
-        && let Some(g) = c.table("groups", v)
-    {
-        for (name, v) in g {
-            if let Some(t) = c.table(&format!("groups.{name}"), v) {
-                c.keys(&format!("groups.{name}"), t, &[], GROUP_IGNORED);
-            }
-        }
-    }
     match root.get("rule") {
         None => {}
         Some(Value::Array(a)) => {
             for (n, v) in a.iter().enumerate() {
                 p.rules
-                    .extend(parse_rule(&mut c, n, v, p.default_block_shift));
+                    .extend(parse_rule(&mut c, n, v, p.default_block_shift, read));
             }
         }
         Some(_) => c.err("`rule` must be an array of tables ([[rule]])".into()),
-    }
-    if let Some(v) = root.get("runtime") {
-        p.runtime = parse_runtime(&mut c, v);
     }
     if !c.errs.is_empty() {
         return Err(c.errs);
@@ -1152,110 +1144,6 @@ pub fn load_profile(path: &Path) -> Result<Profile, Vec<String>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn glob_table() {
-        let t = |p: &str, s: &str, want: bool| assert_eq!(glob_match(p, s), want, "{p} vs {s}");
-        t("*", "a/b/c", true);
-        t("**", "", true);
-        t("a?c", "abc", true);
-        t("a?c", "a/c", true);
-        t("a?c", "ac", false);
-        t("[abc]x", "bx", true);
-        t("[a-c]x", "dx", false);
-        t("[!a-c]x", "dx", true);
-        t("[!a-c]x", "ax", false);
-        t("[]]x", "]x", true);
-        t("[!]]x", "ax", true);
-        t("[z-a]x", "zx", false);
-        // reversed ranges go first, then a lone `!` is any char (CPython fnmatch.translate)
-        t("data/[z-a!].bin", "data/a.bin", true);
-        t("data/[z-a!].bin", "data/!.bin", true);
-        t("[!z-a]", "x", true);
-        t("[!z-a]", "!", true);
-        t("[z-a]", "z", false);
-        t("[z-a]", "a", false);
-        t("[b-a]x", "x", false);
-        t("[a-c-e]", "d", false);
-        t("[a-c-e]", "-", true);
-        t("data/[aa-!-z].bin", "data/b.bin", false);
-        t("data/[aa-!-z].bin", "data/-.bin", true);
-        t("data/[aa-!-z].bin", "data/a.bin", true);
-        t("data/[aa-!-z].bin", "data/z.bin", true);
-        t("[a-cz-xq]", "q", true);
-        t("[a-cz-xq]", "b", true);
-        t("[a-cz-xq]", "z", false);
-        t("[!a-cz-x]", "z", true);
-        // unclosed bracket is a literal
-        t("a[b", "a[b", true);
-        t("a[b", "ab", false);
-        t("[", "[", true);
-        t("[]", "[]", true);
-        t("[!]", "[!]", true);
-        t("a[]b", "a[]b", true);
-        // literal brackets via a set
-        t("a[[]b", "a[b", true);
-        // backtracking
-        t("*a*b*c", "xaxbxbxc", true);
-        t("*a*b*c", "xaxbxbx", false);
-        t(
-            "a*a*a*a*b",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
-            false,
-        );
-        t("*ab", "aab", true);
-        t("*aab", "aaab", true);
-        // root vs nested
-        t("**/*.x", "a.x", false);
-        t("**/*.x", "d/a.x", true);
-        t("*.x", "d/a.x", true);
-        t("**/*.x", "d/e/a.x", true);
-        // case sensitive, whole string
-        t("*.X", "a.x", false);
-        t("a", "ab", false);
-        // separators
-        t("d\\*.x", "d/a.x", true);
-        t("d/*.x", "d\\a.x", true);
-        t("/d/*", "d/a", true);
-        t("d/*", "/d/a", true);
-        // non-ASCII is compared per char
-        t("é?", "éé", true);
-    }
-
-    #[test]
-    fn always_loose_table() {
-        for p in [
-            "eboot.bin",
-            "a/b/eboot.bin",
-            "x.ELF",
-            "d/y.Self",
-            "m.prx",
-            "d/m.SPRX",
-            "sce_sys/param.json",
-            "sce_module/a.bin",
-            "fakelib/libSceAmpr.sprx",
-            "fakelib2/a.dat",
-            "ampr_assets.index",
-            "ampr_assets.index.crc",
-            "ampr_assets.index.runtime",
-            "ampr_emu.index",
-            "ampr_commands.bin",
-            "ampr_emu.log",
-            "apr_emu.log",
-        ] {
-            assert!(always_loose(p), "{p}");
-        }
-        for p in [
-            "fakelib",
-            "fakelibs.txt",
-            "d/sce_sys/a",
-            "data/eboot.bin.bak",
-            "ampr_assets-000.pak",
-            "d/ampr_emu.log",
-        ] {
-            assert!(!always_loose(p), "{p}");
-        }
-    }
-
     fn spec(shift: u8, store: bool, hot: bool, random: bool) -> Option<PackSpec> {
         Some(PackSpec {
             block_shift: shift,
@@ -1266,8 +1154,8 @@ mod tests {
     }
 
     #[test]
-    fn fallback_and_observed() {
-        let f = |p: &str| select(p, 10, &Selection::Fallback);
+    fn fallback_table() {
+        let f = |p: &str| select(p, 10, None);
         assert_eq!(f("data/a.bin"), spec(16, false, false, false));
         assert_eq!(f("a/b/c.bin"), spec(16, false, false, false));
         assert_eq!(f("root.bin"), None, "root-level files stay loose");
@@ -1281,6 +1169,15 @@ mod tests {
         assert_eq!(f("data/_DUPLEX_/a.bin"), spec(16, false, false, false));
         assert_eq!(f("_DUPLEX_/a.bin"), None);
         assert_eq!(f("data/eboot.bin"), None);
+        // Protected families, any case; `fakelib*` by prefix at any depth.
+        for p in ["data/System/a.bin", "data/fakelib_x/a.bin"] {
+            assert_eq!(f(p), None, "{p}");
+        }
+        assert_eq!(
+            f("data/systems/a.bin"),
+            spec(16, false, false, false),
+            "whole names only"
+        );
         for p in [
             "d/a.bik",
             "d/a.MPG",
@@ -1293,253 +1190,207 @@ mod tests {
             assert_eq!(f(p), None, "{p}");
             assert!(keep_loose(p), "{p}");
         }
+        // Insomniac's containers and video folders, any depth and case.
+        for p in ["D/BootLoad_main", "a/Cutscenes/c.bin"] {
+            assert_eq!(f(p), None, "{p}");
+            assert_eq!(loose_reason(p), Some(Loose::Protected), "{p}");
+        }
+        for p in ["d/cinematic2", "a/videogame/b.bin"] {
+            assert_eq!(f(p), spec(16, false, false, false), "{p}");
+            assert_eq!(loose_reason(p), None, "{p}");
+        }
         assert!(
             !keep_loose("root.bin"),
             "the root rule is the fallback's only"
         );
-        assert_eq!(select("data/a.bin", 0, &Selection::Fallback), None, "empty");
-        let set: BTreeSet<String> = ["data/a.bin", "data/x.png", "sce_sys/b.bin", "root.bin"]
-            .map(String::from)
-            .into();
-        let o = |p: &str| select(p, 10, &Selection::Observed(&set));
-        assert_eq!(o("data/a.bin"), spec(16, false, false, false));
-        assert_eq!(o("data/x.png"), None, "traces only narrow the fallback");
-        assert_eq!(o("root.bin"), None, "root files stay loose");
-        assert_eq!(o("sce_sys/b.bin"), None, "safety beats traces");
-        assert_eq!(o("data/other.bin"), None);
+        assert_eq!(select("data/a.bin", 0, None), None, "empty");
     }
 
-    #[test]
-    fn observed_stellar_blade_packs_only_ucas() {
-        let paths = [
-            "contentids.json",
-            "engine/saved/config/ps5/manifest.ini",
-            "sb/content/paks/global.ucas",
-            "sb/content/paks/global.utoc",
-            "sb/content/paks/pakchunk0-ps5.pak",
-            "sb/content/paks/pakchunk0-ps5.ucas",
-            "sb/content/paks/pakchunk0-ps5.utoc",
-            "sb/content/paks/pakchunk1-ps5.ucas",
-            "sb/saved/config/ps5/engine.ini",
-        ];
-        let set: BTreeSet<String> = paths.map(String::from).into();
-        let packed: Vec<&str> = paths
-            .into_iter()
-            .filter(|p| select(p, 1000, &Selection::Observed(&set)).is_some())
-            .collect();
-        assert_eq!(
-            packed,
-            [
-                "sb/content/paks/global.ucas",
-                "sb/content/paks/pakchunk0-ps5.ucas",
-                "sb/content/paks/pakchunk1-ps5.ucas"
-            ]
-        );
-    }
+    /// A Lazy_AMPR community profile (Astro Bot's), as users share them: `[groups]`, upstream
+    /// tuning keys and a typo (`ayout`) load as ignored keys.
+    const ASTROBOT: &str = r#"# Generated by ampr_pack_profile.py 4.0 from APR traces.
 
-    // ---- profile fixtures
-
-    struct Dir(std::path::PathBuf);
-    impl Dir {
-        fn new(tag: &str) -> Dir {
-            let d = std::env::temp_dir().join(format!("forge-rules-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
-            Dir(d)
-        }
-        fn write(&self, name: &str, body: &str) -> std::path::PathBuf {
-            let p = self.0.join(name);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, body).unwrap();
-            p
-        }
-    }
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn load(tag: &str, toml: &str) -> Result<Profile, Vec<String>> {
-        let d = Dir::new(tag);
-        load_profile(&d.write("p.toml", toml))
-    }
-
-    #[test]
-    fn last_match_wins_and_defaults() {
-        let p = load(
-            "last",
-            r#"
 [pack]
-default_action = "Compress"
-default_block_size = "128KiB"
+index_name = "ampr_assets.index"
+pack_pattern = "ampr_assets-{group}-lane{lane:02d}-vol{volume:02d}-{id:03d}.pak"
+default_action = "loose"
+default_block_size = "64KiB"
+io_page_size = "64KiB"
+payload_alignment = "64KiB"
+chunk_alignment = "64B"
+workers = 8
+compression_mode = "hc"
+compression_level = 12
+acceleration = 1
+deduplicate = true
+deduplicate_scope = "lane"
+deduplicate_streaming = false
+min_savings_bytes = 64
+min_savings_ratio = 0.01
+io_neutral_min_savings_bytes = "8KiB"
+io_neutral_min_savings_ratio = 0.125
+auto_loose_large_files = false
+auto_loose_hot_files = false
+auto_loose_min_file_size = "64MiB"
+auto_loose_sample_blocks = 32
+auto_loose_sample_bytes = "16MiB"
+auto_loose_min_savings_ratio = 0.05
+auto_loose_max_raw_ratio = 0.90
+preserve_mtime = true
+validate_index_metadata = true
+
+[groups.assets]
+pack_count = 4
+assignment = "balanced"
+max_pack_size = "16GiB"
+stripe_large_files = false
+
 [[rule]]
-include = "data/**"
-action = "store"
+action = "compress"
+include = ["data/prein/**"]
+block_size = "64KiB"
+group = "assets"
+layout = "mixed"
+
 [[rule]]
-include = ["data/**"]
-exclude = "**/*.raw"
-block_size = 32768
+action = "compress"
+include = ["data/prein/**/*.gnfp", "data/prein/**/*.jxm"]
+block_size = "128KiB"
+group = "assets"
+layout = "mixed"
+
+# observed files=1, reads=211, submitted=5.25 MiB
+# confidence=low:1
+[[rule]]
+action = "compress"
+include = ["data/prein/sound/**"]
+block_size = "16KiB"
+group = "assets"
+ayout = "random"
 hot = true
+min_savings_bytes = 16
+min_savings_ratio = 0.0025
+io_neutral_min_savings_bytes = "2KiB"
+io_neutral_min_savings_ratio = 0.125
+
+# Safety exclusions. The last matching rule wins.
 [[rule]]
-include = "data/keep/**"
 action = "loose"
-"#,
-        )
-        .unwrap();
-        let s = |path: &str| select(path, 5, &Selection::Profile(&p));
+include = [
+  "data/prein/video/*",
+  "sce_module/**",
+  "system/**",
+  "mods/**",
+  "save/**",
+  "**/*.prx",
+  "**/*.sprx",
+  "eboot.bin",
+  "ampr_emu.index",
+  "ampr_assets.index",
+  "ampr_assets-*.pak",
+]
+"#;
+
+    fn no_files(name: &str) -> Result<String, String> {
+        Err(format!("no file {name}"))
+    }
+
+    #[test]
+    fn community_profile_selects_and_broken_ones_are_findings() {
+        let p = parse_profile(ASTROBOT, &mut no_files).unwrap();
+        assert!(!p.auto_loose.enabled);
+        for k in ["groups.*", "rule.ayout"] {
+            assert!(p.ignored.iter().any(|i| i == k), "{k}: {:?}", p.ignored);
+        }
+        let f = |path: &str| select(path, 10, Some(&p));
+        assert_eq!(f("data/prein/sound/a.bin"), spec(14, false, true, true));
         assert_eq!(
-            s("other/a.bin"),
+            f("data/prein/video/a.bin"),
+            None,
+            "the last matching rule wins"
+        );
+        assert_eq!(
+            f("data/prein/t/a.gnfp"),
             spec(17, false, false, false),
-            "pack default"
+            "a profile overrides the keep-loose list"
         );
-        assert_eq!(
-            s("data/a.bin"),
-            spec(15, false, true, true),
-            "last matching rule, auto+hot is random"
-        );
-        assert_eq!(
-            s("data/a.raw"),
-            spec(17, true, false, false).map(|mut x| {
-                x.block_shift = 17;
-                x
-            }),
-            "store rule, default block"
-        );
-        assert_eq!(s("data/keep/a.bin"), None);
-        assert_eq!(s("sce_sys/a.bin"), None);
-        assert_eq!(select("data/a.bin", 0, &Selection::Profile(&p)), None);
-    }
-
-    #[test]
-    fn compiled_lookup_equals_the_reverse_scan() {
-        // Literal, escaped-literal, glob and exclude rules overlapping in both orders.
-        let p = load(
-            "compiled",
-            r#"
-[[rule]]
-include = ["data/a.bin", "data/[[]x].bin", "data/[*]star", "data/q[?]", "data/[]", "/data\\c.bin"]
-[[rule]]
-include = "data/*.bin"
-exclude = "data/b*"
-action = "store"
-[[rule]]
-include = ["data/a.bin", "data/[a-a]2.bin"]
-action = "loose"
-hot = true
-[[rule]]
-include = ["data/[*]star", "x/**"]
-exclude = ["data/[[]*", "x/skip*"]
-layout = "random"
-[[rule]]
-include = "data/b.bin"
-exclude = "**/b.bin"
-[[rule]]
-include = ["data/[ab].bin", "data/[!a]?.bin", "data/q?"]
-block_size = 32768
-[[rule]]
-include = ["data/c.bin", "x/keep", "data/[*]star"]
-exclude = "x/k*p"
-action = "store"
-"#,
-        )
-        .unwrap();
-        let naive = |path: &str| p.rules.iter().rposition(|r| r.matches(path));
-        let mut paths: Vec<String> = Vec::new();
-        for dir in ["data/", "/data/", "data\\", "x/", ""] {
-            for name in [
-                "a.bin", "b.bin", "c.bin", "a2.bin", "[x].bin", "*star", "xstar", "q?", "qz", "[]",
-                "[", "bb.bin", "ab.bin", "keep", "skip1", "k", "",
-            ] {
-                paths.push(format!("{dir}{name}"));
-            }
-        }
-        let mut hits = 0;
-        for path in &paths {
-            let want = naive(path);
-            assert_eq!(p.compiled.last_match(path), want, "{path}");
-            hits += usize::from(want.is_some());
-        }
-        assert!(hits > 20, "the table exercises matches ({hits})");
-        // The overrides the table relies on, spelled out.
-        let m = |path: &str| p.compiled.last_match(path);
-        assert_eq!(m("data/a2.bin"), Some(2), "[a-a] literal over glob");
-        assert_eq!(m("data/c.bin"), Some(6), "literal over glob");
-        assert_eq!(m("data/a.bin"), Some(5), "glob over literal");
-        assert_eq!(m("data/*star"), Some(6), "escaped literal");
-        assert_eq!(m("data/xstar"), None, "[*] is not a glob");
-        assert_eq!(m("data/[x].bin"), Some(1), "[[] literal, then *.bin");
-        assert_eq!(m("x/keep"), Some(3), "excluded literal, earlier glob");
-    }
-
-    #[test]
-    fn profiles_respect_the_keep_loose_list() {
-        let p = load("keep", "[pack]\ndefault_action = \"compress\"\n").unwrap();
-        let s = |path: &str| select(path, 5, &Selection::Profile(&p));
-        for path in [
-            "sb/content/paks/a.pak",
-            "sb/content/paks/a.utoc",
-            "sb/config/x.ini",
-            "d/a.json",
-            "sb/SB.uproject",
-            "d/system/a.bin",
-            "d/save/a.bin",
-            "decrypted/a.bin",
-            "_DUPLEX_/a.bin",
+        assert_eq!(f("sce_sys/icon0.png"), None, "always_loose still wins");
+        assert_eq!(f("data/prein/DLC_EMU.INI"), None, "an .ini stays editable");
+        assert_eq!(f("data/other.bin"), None, "default_action = loose");
+        for bad in [
+            "[pack\n",
+            "[[rule]]\naction = \"pack\"\n",
+            "[pack]\nindex_name = \"other.index\"\n",
         ] {
-            assert_eq!(s(path), None, "{path}");
-            assert!(
-                profile_spec(path, &p).is_some(),
-                "{path}: the profile alone packs it"
-            );
+            assert!(parse_profile(bad, &mut no_files).is_err(), "{bad}");
         }
-        assert_eq!(s("sb/content/paks/a.ucas"), spec(16, false, false, false));
-        assert_eq!(
-            s("data.0"),
-            spec(16, false, false, false),
-            "root files: the profile's call"
-        );
-        assert_eq!(s("d/decrypted/a.bin"), spec(16, false, false, false));
-        assert_eq!(s("eboot.bin"), None);
     }
 
     #[test]
-    #[cfg(unix)]
-    fn pattern_file_escape() {
-        let d = Dir::new("esc");
-        let outside = Dir::new("esc-out");
-        outside.write("o.txt", "x\n");
-        d.write("in.txt", "x\n");
-        let abs = outside.0.join("o.txt");
-        std::os::unix::fs::symlink(&abs, d.0.join("link.txt")).unwrap();
-        std::os::unix::fs::symlink(&outside.0, d.0.join("linkdir")).unwrap();
-        for (i, name) in [
-            "../forge-rules-esc-out-x/o.txt",
-            "link.txt",
-            "linkdir/o.txt",
-            abs.to_str().unwrap(),
-            "missing.txt",
-            "/etc/hosts",
-            "..\\x",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let body = format!(
-                "[[rule]]\ninclude_from = \"{}\"\n",
-                name.replace('\\', "\\\\")
-            );
-            let p = d.write(&format!("p{i}.toml"), &body);
-            assert!(load_profile(&p).is_err(), "{name}");
-        }
-        let up = format!(
-            "../{}/o.txt",
-            outside.0.file_name().unwrap().to_str().unwrap()
+    fn pattern_files_extend_rules_and_bad_names_are_findings() {
+        let files = std::collections::HashMap::from([
+            (
+                "lists/pack.txt",
+                "# packed\r\n\r\n  data/a/**  \r\ndata/b.bin\r\n",
+            ),
+            // a lone `\r` ends a line, as in upstream's `splitlines`
+            ("skip.txt", "data/a/skip.bin\rdata/a/skip2.bin"),
+            ("none.txt", "# nothing\n\n"),
+        ]);
+        let mut read = |name: &str| {
+            files
+                .get(name)
+                .map(|t| t.to_string())
+                .ok_or_else(|| "missing".to_string())
+        };
+        let text = "[pack]\ndefault_action = \"loose\"\n[[rule]]\naction = \"compress\"\n\
+                    include_from = \"lists/pack.txt\"\nexclude_from = [\"skip.txt\"]\n";
+        let p = parse_profile(text, &mut read).unwrap();
+        assert!(p.ignored.is_empty(), "{:?}", p.ignored);
+        let f = |path: &str| select(path, 10, Some(&p));
+        assert_eq!(f("data/a/x.bin"), spec(16, false, false, false));
+        assert_eq!(f("data/b.bin"), spec(16, false, false, false));
+        assert_eq!(f("data/c.bin"), None, "no default `**` with include_from");
+        assert_eq!(f("data/a/skip.bin"), None, "exclude_from");
+        assert_eq!(
+            f("data/a/skip2.bin"),
+            None,
+            "a `\\r`-separated exact exclude"
         );
-        let p = d.write("up.toml", &format!("[[rule]]\nexclude_from = \"{up}\"\n"));
-        let e = load_profile(&p).unwrap_err().join("\n");
-        assert!(e.contains("leaves"), "{e}");
-        let p = d.write("ok.toml", "[[rule]]\ninclude_from = \"./in.txt\"\n");
-        assert!(load_profile(&p).is_ok());
+        let p = parse_profile("[[rule]]\ninclude_from = \"none.txt\"\n", &mut read).unwrap();
+        assert_eq!(
+            select("data/c.bin", 10, Some(&p)),
+            spec(16, false, false, false),
+            "no pattern in the files: the default `**`, as upstream"
+        );
+        let capped = |lines: String, why: &str| {
+            let errs = parse_profile("[[rule]]\ninclude_from = \"a\"\n", &mut |_| {
+                Ok(lines.clone())
+            })
+            .unwrap_err();
+            assert!(errs.iter().any(|e| e.contains(why)), "{why}: {errs:?}");
+        };
+        capped(
+            (0..=MAX_FILE_PATTERNS)
+                .map(|i| format!("d/{i}\n"))
+                .collect(),
+            "more than 200000 patterns in all",
+        );
+        capped(
+            (0..=MAX_FILE_GLOBS).map(|i| format!("d/{i}*\n")).collect(),
+            "more than 10000 patterns with a wildcard",
+        );
+        for (bad, why) in [
+            ("/abs", "must be a path inside the profile's folder"),
+            ("../x", "must be a path inside the profile's folder"),
+            ("a/./b", "must be a path inside the profile's folder"),
+            ("a\\\\b", "must be a path inside the profile's folder"),
+            ("C:x", "must be a path inside the profile's folder"),
+            ("gone.txt", "`rule.include_from` file gone.txt: missing"),
+        ] {
+            let text = format!("[[rule]]\ninclude_from = \"{bad}\"\n");
+            let errs = parse_profile(&text, &mut read).unwrap_err();
+            assert!(errs.iter().any(|e| e.contains(why)), "{bad}: {errs:?}");
+        }
     }
 }

@@ -54,6 +54,10 @@ impl Pkg {
         Self { file, len }
     }
 
+    pub fn into_file(self) -> Box<dyn ReadSeek> {
+        self.file
+    }
+
     pub fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<()> {
         let fits = off
             .checked_add(buf.len() as u64)
@@ -178,13 +182,19 @@ pub(crate) fn header(pkg: &mut Pkg) -> Result<Header> {
 pub(crate) struct Entry {
     pub id: u32,
     pub flags1: u32,
+    /// For a protected entry (`flags1` bit 31) the key index is `flags2 >> 12`.
+    pub flags2: u32,
     /// Absolute offset in the package.
     pub at: u64,
     pub size: u64,
+    /// The entry's 32-byte table row as stored: a protected entry's key depends on it.
+    pub row: [u8; 32],
 }
 
 pub(crate) struct Container {
     pub content_id: String,
+    /// The header's content type (`0x20`/`0x26` a game, `0x21` additional content).
+    pub content_type: u32,
     pub entries: Vec<Entry>,
 }
 
@@ -233,8 +243,10 @@ pub(crate) fn container(pkg: &mut Pkg, cnt_offset: u64) -> Result<Container> {
         entries.push(Entry {
             id,
             flags1: be32(row, 8),
+            flags2: be32(row, 12),
             at,
             size,
+            row: *row,
         });
     }
     let content_id = String::from_utf8_lossy(&head[0x40..0x64])
@@ -242,6 +254,7 @@ pub(crate) fn container(pkg: &mut Pkg, cnt_offset: u64) -> Result<Container> {
         .to_string();
     Ok(Container {
         content_id,
+        content_type: be32(&head, 0x74),
         entries,
     })
 }
@@ -484,6 +497,19 @@ impl OuterFile {
             size: node.size,
             map,
         })
+    }
+
+    /// The outer blocks behind bytes `range` of this file (clipped to it).
+    pub fn outer_blocks(&self, range: std::ops::Range<u64>) -> impl Iterator<Item = u64> + '_ {
+        let first = (range.start / BLOCK) as usize;
+        let last = if range.is_empty() {
+            first
+        } else {
+            (range.end.min(self.size).div_ceil(BLOCK) as usize).max(first)
+        };
+        self.map[first.min(self.map.len())..last.min(self.map.len())]
+            .iter()
+            .map(|&i| u64::from(i))
     }
 
     /// Exactly `buf.len()` bytes at `off`.

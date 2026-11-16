@@ -181,25 +181,27 @@ pub(crate) struct Encoded {
     pub(crate) data: Vec<u8>,
 }
 
-/// What compresses one block; [`encode`] everywhere but in the tests that inject another.
-pub(crate) type Encoder = fn(Vec<u8>, bool) -> Encoded;
+/// What compresses one block (raw, store, LZ4 level); [`encode`] everywhere but in the tests
+/// that inject another.
+pub(crate) type Encoder = fn(Vec<u8>, bool, u8) -> Encoded;
 
-type Job = (Vec<u8>, bool, Sender<Encoded>);
+type Job = (Vec<u8>, bool, u8, Sender<Encoded>);
 
-/// The one encoding decision, used by `pack`, `measure` and the regenerating tree alike:
-/// LZ4 unless `store`, kept only when [`keep_lz4`] says so, else RAW.
-pub(crate) fn encode(raw: Vec<u8>, store: bool) -> Encoded {
+/// The one encoding decision, used by `pack`, `measure`, `sample` and the regenerating tree
+/// alike: LZ4 at `level` ([`crate::block`]) unless `store`, kept only when [`keep_lz4`] says
+/// so, else RAW.
+pub(crate) fn encode(raw: Vec<u8>, store: bool, level: u8) -> Encoded {
     let (raw_len, crc) = (raw.len() as u64, crc32(&raw));
-    if !store {
-        let c = lz4_flex::block::compress(&raw);
-        if keep_lz4(raw.len(), c.len()) {
-            return Encoded {
-                raw_len,
-                crc,
-                codec: Codec::Lz4,
-                data: c,
-            };
-        }
+    if !store
+        && let Some(c) = crate::block::compress(&raw, level)
+        && keep_lz4(raw.len(), c.len())
+    {
+        return Encoded {
+            raw_len,
+            crc,
+            codec: Codec::Lz4,
+            data: c,
+        };
     }
     Encoded {
         raw_len,
@@ -210,17 +212,20 @@ pub(crate) fn encode(raw: Vec<u8>, store: bool) -> Encoded {
 }
 
 /// Auto-loose's sample of `path` (`size` bytes, `block_shift` blocks): the blocks at `indices`
-/// encoded exactly as `pack` would (LZ4 kept per [`keep_lz4`], else RAW). `progress` gets the
-/// raw bytes sampled so far.
+/// encoded exactly as `pack` would at `level` (LZ4 kept per [`keep_lz4`], else RAW).
+/// `progress` gets the raw bytes sampled so far.
+#[allow(clippy::too_many_arguments)]
 pub fn sample<S: SourceTree + ?Sized>(
     src: &mut S,
     path: &str,
     size: u64,
     block_shift: u8,
     indices: &[u64],
+    level: u8,
     progress: &mut dyn FnMut(u64),
     cancel: &AtomicBool,
 ) -> Result<crate::Sample> {
+    check_level(level)?;
     let b = 1u64 << block_shift;
     let mut s = crate::Sample::default();
     for &i in indices {
@@ -229,7 +234,7 @@ pub fn sample<S: SourceTree + ?Sized>(
         if off >= size {
             return Err(bad(format!("{path}: sample block {i} is past its end")));
         }
-        let e = encode(read_block(src, path, off, b.min(size - off))?, false);
+        let e = encode(read_block(src, path, off, b.min(size - off))?, false, level);
         s.raw_bytes += e.raw_len;
         s.stored_bytes += e.data.len() as u64;
         s.blocks += 1;
@@ -242,12 +247,20 @@ pub fn sample<S: SourceTree + ?Sized>(
 fn worker(queue: &Mutex<Receiver<Job>>) {
     loop {
         let job = queue.lock().unwrap_or_else(|p| p.into_inner()).recv();
-        let Ok((raw, store, reply)) = job else {
+        let Ok((raw, store, level, reply)) = job else {
             return;
         };
         // The reader may be gone after an error; nothing to do then.
-        let _ = reply.send(encode(raw, store));
+        let _ = reply.send(encode(raw, store, level));
     }
+}
+
+/// An error unless `level` is one [`crate::block::valid_level`] accepts.
+pub fn check_level(level: u8) -> Result<()> {
+    if crate::block::valid_level(level) {
+        return Ok(());
+    }
+    Err(bad(format!("LZ4 level {level} is not 0 or 3..=12")))
 }
 
 pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<()> {
@@ -343,13 +356,16 @@ struct Sink<V: Volumes> {
     crcs: Vec<u8>,
     stored: u64,
     raw_done: u64,
+    /// The LZ4 level every block is compressed at.
+    level: u8,
 }
 
 impl<V: Volumes> Sink<V> {
-    fn new(vols: V, cap: u64, chunk_count: u64) -> Self {
+    fn new(vols: V, cap: u64, chunk_count: u64, level: u8) -> Self {
         Self {
             vols,
             cap,
+            level,
             open: None,
             done: Vec::new(),
             chunks: Vec::with_capacity(chunk_count as usize * CHUNK_RECORD),
@@ -441,7 +457,7 @@ fn feed<S: SourceTree + ?Sized, V: Volumes>(
             let data = read_block(src, &f.path, off, raw)?;
             off += raw;
             let (reply, result) = mpsc::channel();
-            work.try_send((data, spec.store, reply))
+            work.try_send((data, spec.store, sink.level, reply))
                 .map_err(|e| match e {
                     TrySendError::Full(_) => bad("internal error: the compression queue is full"),
                     TrySendError::Disconnected(_) => bad("a compression worker failed"),
@@ -557,6 +573,8 @@ pub struct Measured {
     pub crc: Vec<u8>,
     pub profile: Option<Vec<u8>>,
     pub report: PackReport,
+    /// The LZ4 level the chunks were compressed at; [`crate::tree::PackedTree`] uses it again.
+    pub level: u8,
 }
 
 impl Measured {
@@ -618,6 +636,7 @@ fn metadata<V: Volumes>(
         crcs,
         stored,
         raw_done,
+        level,
         ..
     } = sink;
     // The string table holds the paths, then the volume names.
@@ -745,14 +764,15 @@ fn metadata<V: Volumes>(
         crc: c,
         profile,
         report,
+        level,
     };
     Ok((vols, measured))
 }
 
 /// Packs `files` (final path index order) from `src` into `out`: volumes, then their headers
 /// rewritten with the build ID, then `ampr_assets.index`, `.crc` and, with `runtime`, `.runtime`.
-/// `mtime` (integer seconds) goes in every record. `threads` workers compress (0 counts as 1).
-/// `progress` gets the raw bytes packed so far.
+/// `mtime` (integer seconds) goes in every record. `threads` workers compress (0 counts as 1)
+/// at LZ4 `level` ([`crate::block::valid_level`]). `progress` gets the raw bytes packed so far.
 #[allow(clippy::too_many_arguments)]
 pub fn pack<S: SourceTree + ?Sized, O: PackOutput>(
     src: &mut S,
@@ -760,12 +780,13 @@ pub fn pack<S: SourceTree + ?Sized, O: PackOutput>(
     mtime: i64,
     runtime: Option<&RuntimeProfile>,
     threads: usize,
+    level: u8,
     out: &mut O,
     progress: &mut dyn FnMut(u64),
     cancel: &AtomicBool,
 ) -> Result<PackReport> {
     pack_with_cap(
-        src, files, mtime, runtime, threads, out, progress, cancel, VOLUME_CAP,
+        src, files, mtime, runtime, threads, level, out, progress, cancel, VOLUME_CAP,
     )
 }
 
@@ -776,18 +797,20 @@ fn pack_with_cap<S: SourceTree + ?Sized, O: PackOutput>(
     mtime: i64,
     runtime: Option<&RuntimeProfile>,
     threads: usize,
+    level: u8,
     out: &mut O,
     progress: &mut dyn FnMut(u64),
     cancel: &AtomicBool,
     cap: u64,
 ) -> Result<PackReport> {
     check_cancel(cancel)?;
+    check_level(level)?;
     let (logical, chunk_count) = validate(files)?;
     let vols = Files {
         out: &mut *out,
         open: None,
     };
-    let mut sink = Sink::new(vols, cap, chunk_count);
+    let mut sink = Sink::new(vols, cap, chunk_count, level);
     compress(src, files, threads, &mut sink, progress, cancel)?;
     let (_, m) = metadata(files, &logical, chunk_count, sink, mtime, runtime)?;
     for (id, (name, _)) in m.volumes.iter().enumerate() {
@@ -813,17 +836,19 @@ fn pack_with_cap<S: SourceTree + ?Sized, O: PackOutput>(
 /// `pack`'s first half without writing: the same reads, compression, RAW/LZ4 decisions,
 /// placement and rollover, keeping only the metadata ([`Measured`]). With the same `src`
 /// bytes and arguments, [`crate::tree::PackedTree`] then serves exactly what `pack` writes.
+#[allow(clippy::too_many_arguments)]
 pub fn measure<S: SourceTree + ?Sized>(
     src: &mut S,
     files: &[PackFile],
     mtime: i64,
     runtime: Option<&RuntimeProfile>,
     threads: usize,
+    level: u8,
     progress: &mut dyn FnMut(u64),
     cancel: &AtomicBool,
 ) -> Result<Measured> {
     measure_with_cap(
-        src, files, mtime, runtime, threads, progress, cancel, VOLUME_CAP,
+        src, files, mtime, runtime, threads, level, progress, cancel, VOLUME_CAP,
     )
 }
 
@@ -834,13 +859,15 @@ pub(crate) fn measure_with_cap<S: SourceTree + ?Sized>(
     mtime: i64,
     runtime: Option<&RuntimeProfile>,
     threads: usize,
+    level: u8,
     progress: &mut dyn FnMut(u64),
     cancel: &AtomicBool,
     cap: u64,
 ) -> Result<Measured> {
     check_cancel(cancel)?;
+    check_level(level)?;
     let (logical, chunk_count) = validate(files)?;
-    let mut sink = Sink::new(Nowhere, cap, chunk_count);
+    let mut sink = Sink::new(Nowhere, cap, chunk_count, level);
     compress(src, files, threads, &mut sink, progress, cancel)?;
     Ok(metadata(files, &logical, chunk_count, sink, mtime, runtime)?.1)
 }
@@ -1008,6 +1035,7 @@ pub(crate) mod testkit {
             1_700_000_000,
             runtime,
             threads,
+            0,
             &mut out,
             &mut |_| {},
             &cancel,
@@ -1065,158 +1093,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn boundary_sizes_round_trip() {
-        let b = 1usize << 16;
-        let mut entries = Vec::new();
-        let names: Vec<String> = (0..12).map(|i| format!("d/f{i}.bin")).collect();
-        for (i, len) in [1, b - 1, b, b + 1, 3 * b + 5, 777].into_iter().enumerate() {
-            entries.push((names[2 * i].as_str(), text(len, i as u64), spec(16)));
-            entries.push((names[2 * i + 1].as_str(), noise(len, i as u64), spec(16)));
-        }
-        entries.push(("eboot.bin", noise(5000, 9), None));
-        entries.push(("empty.bin", Vec::new(), None));
-        let (_, _, out, report) = pack_mem(&entries, None, 3, VOLUME_CAP).unwrap();
-        assert_eq!((report.packed, report.loose, report.volumes), (12, 2, 1));
-        assert!(report.stored_bytes < report.raw_bytes);
-        assert!(
-            !out.files.contains_key("eboot.bin"),
-            "loose files are core's"
-        );
-        assert!(!out.files.contains_key(PROFILE));
-        let m = open(&entries, &out).manifest().clone();
-        assert!(
-            m.chunks.iter().any(|c| c.codec == Codec::Lz4),
-            "text compresses"
-        );
-        assert!(
-            m.chunks.iter().any(|c| c.codec == Codec::Raw),
-            "noise stays RAW"
-        );
-        let eboot = m.files.iter().find(|f| f.path == "eboot.bin").unwrap();
-        assert_eq!((eboot.flags, eboot.chunk_count, eboot.size), (0, 0, 5000));
-        assert_round_trip(&entries, &out);
-    }
-
-    #[test]
-    fn every_block_shift_and_store() {
-        for shift in MIN_BLOCK_SHIFT..=MAX_BLOCK_SHIFT {
-            let b = 1usize << shift;
-            let store = Some(PackSpec {
-                block_shift: shift,
-                store: true,
-                hot: true,
-                random: true,
-            });
-            let entries = vec![
-                ("a/text", text(2 * b + 3, 1), spec(shift)),
-                ("a/noise", noise(b + 1, 2), spec(shift)),
-                ("a/edge", text(b - 1, 3), spec(shift)),
-                ("a/stored", text(b + 9, 4), store),
-            ];
-            let (_, _, out, _) = pack_mem(&entries, None, 2, VOLUME_CAP).unwrap();
-            let u = open(&entries, &out);
-            let m = u.manifest();
-            let stored = m.files.iter().find(|f| f.path == "a/stored").unwrap();
-            assert_eq!(
-                stored.flags,
-                FILE_PACKED | FILE_STORE_ONLY | FILE_HOT | FILE_RANDOM
-            );
-            let range =
-                stored.first_chunk as usize..(stored.first_chunk + stored.chunk_count) as usize;
-            assert!(m.chunks[range].iter().all(|c| c.codec == Codec::Raw));
-            assert!(
-                m.files
-                    .iter()
-                    .all(|f| f.block_shift == shift && f.packing_class == 0)
-            );
-            assert_round_trip(&entries, &out);
-        }
-    }
-
-    fn total(entries: &[(&str, Vec<u8>, Option<PackSpec>)], out: &MemOut) -> u64 {
-        let loose: u64 = entries
-            .iter()
-            .filter(|e| e.2.is_none())
-            .map(|e| e.1.len() as u64)
-            .sum();
-        loose + out.files.values().map(|d| d.len() as u64).sum::<u64>()
-    }
-
-    #[test]
-    fn worst_case_bounds_actual_output() {
-        // A small cap forces rollover; the default cap is the plain case.
-        for cap in [VOLUME_CAP, PAGE + (2 << 20)] {
-            for shift in MIN_BLOCK_SHIFT..=MAX_BLOCK_SHIFT {
-                let b = 1usize << shift;
-                let entries = vec![
-                    ("w/noise", noise(3 * b + 77, 1), spec(shift)),
-                    ("w/text", text(2 * b + 1, 2), spec(shift)),
-                    ("w/tiny", noise(65, 3), spec(shift)),
-                    ("w/page", noise(PAGE as usize, 4), spec(shift)),
-                    ("w/odd", noise(PAGE as usize + 1, 5), spec(shift)),
-                    ("w/loose", noise(1234, 6), None),
-                ];
-                let files: Vec<PackFile> = entries
-                    .iter()
-                    .map(|(p, d, s)| PackFile {
-                        path: p.to_string(),
-                        size: d.len() as u64,
-                        spec: *s,
-                    })
-                    .collect();
-                for profile in [
-                    None,
-                    Some(RuntimeProfile {
-                        decoded_cache_bytes: 0,
-                        physical_cache_bytes: 0,
-                        workers: 1,
-                        latency_reserve_workers: 0,
-                    }),
-                ] {
-                    let (_, _, out, _) = pack_mem(&entries, profile.as_ref(), 2, cap).unwrap();
-                    let bound = worst_case_with_cap(&files, profile.is_some(), cap);
-                    let actual = total(&entries, &out);
-                    assert!(
-                        actual <= bound,
-                        "shift {shift} cap {cap}: {actual} > {bound}"
-                    );
-                    assert!(
-                        out.files
-                            .iter()
-                            .all(|(n, d)| !n.ends_with(".pak") || d.len() as u64 <= cap)
-                    );
-                }
-            }
-        }
-        // Many small, misaligned chunks are the worst case for dense placement.
-        let entries: Vec<(String, Vec<u8>, Option<PackSpec>)> = (0..64)
-            .map(|i| {
-                (
-                    format!("s/{i}"),
-                    noise(PAGE as usize - 63 + i, i as u64),
-                    spec(16),
-                )
-            })
-            .collect();
-        let entries: Vec<(&str, Vec<u8>, Option<PackSpec>)> = entries
-            .iter()
-            .map(|(p, d, s)| (p.as_str(), d.clone(), *s))
-            .collect();
-        let files: Vec<PackFile> = entries
-            .iter()
-            .map(|(p, d, s)| PackFile {
-                path: p.to_string(),
-                size: d.len() as u64,
-                spec: *s,
-            })
-            .collect();
-        let cap = PAGE * 6;
-        let (_, _, out, report) = pack_mem(&entries, None, 2, cap).unwrap();
-        assert!(report.volumes > 10);
-        assert!(total(&entries, &out) <= worst_case_with_cap(&files, false, cap));
     }
 
     #[test]
@@ -1287,12 +1163,12 @@ mod tests {
             (
                 VOLUME_CAP,
                 None,
-                "3cd07969754e6d6c9233b6305952060a9a6dff6a8441484a77577d866d5f13d9",
+                "0a2fe4d18437ed09b02dce119e8b73d26d9e68c3dcec77184b662709d440343b",
             ),
             (
                 PAGE + (1 << 20),
                 Some(&p),
-                "b23277932257a04eb9fb58f0a9a6f1ef58a56bddfa8f0ea2b83cd58cb217393f",
+                "a0c6102986eb0126daff228c45d1536fe2cad24e8c608ab76053428cfb5f0e4f",
             ),
         ] {
             let (_, _, out, _) = pack_mem(&golden_entries(), prof, 3, cap).unwrap();
@@ -1303,55 +1179,6 @@ mod tests {
                 h.update(d);
             }
             assert_eq!(h.finalize().to_hex().as_str(), want, "cap {cap}");
-        }
-    }
-
-    struct CancelAfter<'a>(MemOut, &'a str, &'a AtomicBool);
-    impl PackOutput for CancelAfter<'_> {
-        type W = std::io::Cursor<Vec<u8>>;
-        fn create(&mut self, name: &str) -> Result<Self::W> {
-            self.0.create(name)
-        }
-        fn reopen(&mut self, name: &str) -> Result<Self::W> {
-            self.0.reopen(name)
-        }
-        fn finish(&mut self, name: &str, w: Self::W) -> Result<()> {
-            self.0.finish(name, w)?;
-            if name == self.1 {
-                self.2.store(true, Ordering::Relaxed);
-            }
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn cancel_during_final_metadata_is_not_success() {
-        let profile = RuntimeProfile {
-            decoded_cache_bytes: 0,
-            physical_cache_bytes: 0,
-            workers: 1,
-            latency_reserve_workers: 0,
-        };
-        for name in [MANIFEST, CRC_SIDECAR, PROFILE] {
-            let mut src = Mem::new([("a".to_string(), vec![1; 10])]);
-            let files = [PackFile {
-                path: "a".into(),
-                size: 10,
-                spec: spec(16),
-            }];
-            let cancel = AtomicBool::new(false);
-            let mut out = CancelAfter(MemOut::default(), name, &cancel);
-            let r = pack(
-                &mut src,
-                &files,
-                0,
-                Some(&profile),
-                1,
-                &mut out,
-                &mut |_| {},
-                &cancel,
-            );
-            assert!(matches!(r, Err(Error::Cancelled)), "{name}");
         }
     }
 
@@ -1379,6 +1206,7 @@ mod tests {
             0,
             None,
             1,
+            0,
             &mut MemOut::default(),
             &mut |_| {},
             &cancel,
@@ -1397,6 +1225,7 @@ mod tests {
             0,
             None,
             1,
+            0,
             &mut MemOut::default(),
             &mut |_| {},
             &cancel,

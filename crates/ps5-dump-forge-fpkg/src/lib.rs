@@ -15,10 +15,13 @@
 //! Errors are [`ps5upload_fpkg::Error::Format`] messages that start with one of the prefixes
 //! below, so a caller can tell the cases apart without parsing the rest.
 
+mod lih;
 mod mount;
 mod pfs;
+mod protected;
 mod tree;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use ps5upload_fpkg::cnt::ids;
@@ -47,6 +50,8 @@ pub const NATIVE_UNDECODABLE: &str = "native-encrypted image this reader cannot 
 pub const UNSUPPORTED_CODEC: &str = "unsupported codec";
 /// Anything else: truncated, damaged, or structurally inconsistent.
 pub const CORRUPT: &str = "corrupt package";
+/// A patch package's read of a block only the base game holds.
+pub const IN_BASE: &str = "not in this patch";
 
 /// The most [`SourceTree::read`] returns whole; larger files go through `read_range`.
 pub const MAX_WHOLE_READ: u64 = 256 << 20;
@@ -88,9 +93,9 @@ pub(crate) fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync
 
 /// The container entries that carry a game file: the presentation set the builder copies into
 /// the container (icons, `pic*` PNGs and DDSs, `snd0.at9`, `save_data.png`, trophy and UDS data), and
-/// `param.json`, `nptitle.dat` and the `npbind.dat` files, which a third-party builder can keep
-/// only in the container (plaintext; ours keeps them in the image too and encrypts the
-/// container's NP copies, which the merge skips). Everything else in a container is the
+/// `param.json`, `nptitle.dat` and the `npbind.dat` files, which a package can keep only in the
+/// container, plaintext or protected (encrypted: `flags1` bit 31, see [`protected`]; ours keeps
+/// them in the image too, where the image's copy wins). Everything else in a container is the
 /// package's own metadata (keys, digests, license, PlayGo tables) and is not a file of the game.
 fn container_paths() -> impl Iterator<Item = (u32, &'static str)> {
     [
@@ -103,12 +108,41 @@ fn container_paths() -> impl Iterator<Item = (u32, &'static str)> {
     .chain(PROTECTED.iter().map(|(id, path, _, _)| (*id, *path)))
 }
 
+/// Where the container entry `e`, the game file `path`, is read from: the package at the
+/// entry's own offset, or, for a protected entry, its decrypted copy pushed onto `held`. `None`
+/// when a protected entry can't be decrypted (the entry is left out and `facts` says why).
+fn place_entry(
+    pkg: &mut Pkg,
+    cnt: &pfs::Container,
+    e: &pfs::Entry,
+    path: &str,
+    passcode: &str,
+    held: &mut Vec<Vec<u8>>,
+    facts: &mut Vec<String>,
+) -> Option<Where> {
+    if e.flags1 & protected::FLAG == 0 {
+        return Some(Where::Container(e.at));
+    }
+    match protected::plaintext(pkg, cnt, e, passcode) {
+        Ok(bytes) => {
+            held.push(bytes);
+            Some(Where::Held(held.len() - 1))
+        }
+        Err(why) => {
+            facts.push(format!("{path}: protected container entry left out: {why}"));
+            None
+        }
+    }
+}
+
 /// Where a file's bytes are.
 enum Where {
     /// In the inner image: a mount offset (Kraken) or an on-disk one (flat).
     Inner(u64),
     /// A container entry, at this absolute package offset.
     Container(u64),
+    /// A protected container entry, decrypted at open: `held[n]`.
+    Held(usize),
 }
 
 /// The layers a read goes through, kept apart so each can borrow the others.
@@ -119,6 +153,16 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
+    /// Every outer block behind mount bytes `at..at + size` is in `present`.
+    pub(crate) fn carried(&self, at: u64, size: u64, present: &HashSet<u64>) -> bool {
+        let has =
+            |r: std::ops::Range<u64>| self.image.outer_blocks(r).all(|b| present.contains(&b));
+        match &self.layout {
+            Layout::Kraken(k) => k.stored(at, size).all(has),
+            Layout::Flat(_) => has(at..at + size),
+        }
+    }
+
     /// Exactly `buf.len()` bytes at `off`: of the mount for a Kraken image; of the stored image
     /// for a flat one, which is the mount from the metadata base on and where a file's `at` is
     /// already its on-disk offset (see [`flat_placements`]).
@@ -135,12 +179,15 @@ pub struct FpkgSource {
     files: Vec<SourceFile>,
     /// Parallel to `files`.
     places: Vec<Where>,
+    /// The decrypted protected entries `Where::Held` points into.
+    held: Vec<Vec<u8>>,
     empty_dirs: Vec<String>,
     conflicts: Vec<String>,
     details: Vec<String>,
     label: String,
     content_id: String,
     reader: Reader,
+    patch: bool,
 }
 
 impl FpkgSource {
@@ -162,6 +209,20 @@ impl FpkgSource {
         let label = label.into();
         let passcode = passcode.unwrap_or(DEFAULT_PASSCODE);
         let mut pkg = Pkg::new(file, len);
+        let mut magic = [0u8; 4];
+        let patch = if len >= 4 {
+            pkg.read_at(0, &mut magic)?;
+            lih::is_lih(&magic)
+        } else {
+            false
+        };
+        let mut patch_facts = None;
+        if patch {
+            let (view, facts) = lih::View::open(pkg.into_file(), len)?;
+            let len = view.len();
+            pkg = Pkg::new(Box::new(view), len);
+            patch_facts = Some(facts);
+        }
         let h = pfs::header(&mut pkg)?;
         let cnt = pfs::container(&mut pkg, h.cnt_offset)?;
         let digests = cnt
@@ -191,6 +252,14 @@ impl FpkgSource {
                 h.format_version
             ),
         ];
+        if let Some(p) = &patch_facts {
+            facts.push(format!(
+                "patch package (LIH): holds {} of the patched package's {} outer blocks; the \
+                 rest are the base game's",
+                p.present.len(),
+                p.outer_blocks
+            ));
+        }
         if sb.plaintext {
             facts.push("image mode: plaintext (PPRPLAIN-NOAUTH!), no passcode needed".into());
         } else {
@@ -224,21 +293,21 @@ impl FpkgSource {
         let image_ino = child(&mut outer, &nodes, uroot, "pfs_image.dat")?;
         let naps_ino = child(&mut outer, &nodes, uroot, "naps_pkg_layout.dat")?;
         let image = OuterFile::map(&mut outer, &nodes[image_ino], "pfs_image.dat")?;
-        if nodes[naps_ino].size > mount::MAX_DESCRIPTOR {
+        // `Layout::parse` bounds what the descriptor's counts cost; this bounds the blob itself.
+        if nodes[naps_ino].size > mount::MAX_OPEN {
             return Err(err(
                 CORRUPT,
                 format!(
                     "the layout descriptor is {} bytes (at most {} read)",
                     nodes[naps_ino].size,
-                    mount::MAX_DESCRIPTOR
+                    mount::MAX_OPEN
                 ),
             ));
         }
         let naps_file = OuterFile::map(&mut outer, &nodes[naps_ino], "naps_pkg_layout.dat")?;
         let mut blob = vec![0u8; naps_file.size as usize];
         naps_file.read(&mut outer, 0, &mut blob)?;
-        let layout = Layout::parse(&blob, image.size)?;
-        drop(blob);
+        let layout = Layout::parse(blob, image.size)?;
 
         let meta_base = h.meta_base;
         let mount_size = match &layout {
@@ -277,7 +346,7 @@ impl FpkgSource {
             image,
             layout,
         };
-        let mut inner = tree::walk(&mut reader, meta_base, mount_size)?;
+        let mut inner = tree::walk(&mut reader, meta_base, mount_size, patch)?;
         if let Layout::Flat(l) = &reader.layout {
             flat_placements(&mut inner.files, l, meta_base)?;
         }
@@ -302,11 +371,11 @@ impl FpkgSource {
         // skipped (and noted when they disagree) where it does.
         let mut conflicts = Vec::new();
         let mut from_container = 0usize;
+        let mut held: Vec<Vec<u8>> = Vec::new();
         for (id, path) in container_paths() {
             let Some(e) = cnt.entry(id) else { continue };
-            // An empty slot is how the builder leaves an icon out; a protected (encrypted) entry
-            // is not a plain copy of anything.
-            if e.size == 0 || e.flags1 & 0x8000_0000 != 0 {
+            // An empty slot is how the builder leaves an icon out.
+            if e.size == 0 {
                 continue;
             }
             if dirs.contains(path) {
@@ -335,15 +404,54 @@ impl FpkgSource {
                 }
                 continue;
             }
+            // A protected entry (nptitle.dat, the npbind files: AES-128-CBC, keyed by the content
+            // id and passcode) is decrypted here, once: without them trophies don't register
+            // from a converted copy. One that can't be left out, and the fact says why.
+            let Some(place) = place_entry(
+                &mut reader.outer.pkg,
+                &cnt,
+                &e,
+                path,
+                passcode,
+                &mut held,
+                &mut facts,
+            ) else {
+                continue;
+            };
             empty_dirs.retain(|d| !path.starts_with(&format!("{d}/")));
             files.push((
                 SourceFile {
                     path: path.to_string(),
                     size: e.size,
                 },
-                Where::Container(e.at),
+                place,
             ));
             from_container += 1;
+        }
+        // A patch lists only the files it carries whole: the rest read the base game's blocks.
+        if let Some(p) = &patch_facts {
+            let mut partial = Vec::new();
+            files.retain(|(f, at)| {
+                let whole = match at {
+                    Where::Container(_) | Where::Held(_) => true,
+                    Where::Inner(at) => reader.carried(*at, f.size, &p.present),
+                };
+                if !whole {
+                    partial.push(f.path.clone());
+                }
+                whole
+            });
+            partial.sort();
+            inner.in_base.sort();
+            facts.push(format!(
+                "patch: {} files carried whole; left out: {} files partly the base game's{}, {} \
+                 entries the base game lists{}",
+                files.len(),
+                partial.len(),
+                first_ten(&partial),
+                inner.in_base.len(),
+                first_ten(&inner.in_base)
+            ));
         }
         files.sort_by(|a, b| a.0.path.cmp(&b.0.path));
         empty_dirs.sort();
@@ -357,13 +465,20 @@ impl FpkgSource {
         Ok(Self {
             files,
             places,
+            held,
             empty_dirs,
             conflicts,
             details: facts,
             label,
             content_id: cnt.content_id,
             reader,
+            patch,
         })
+    }
+
+    /// A patch package (`\x7FLIH`): only the files it carries whole are listed.
+    pub fn is_patch(&self) -> bool {
+        self.patch
     }
 
     /// Format facts for `inspect` (content id, image mode, codec, sizes), one per line.
@@ -382,6 +497,69 @@ impl FpkgSource {
             .binary_search_by(|f| f.path.as_str().cmp(path))
             .map_err(|_| Error::Format(format!("{path} is not in {}", self.label)))
     }
+}
+
+/// `path` starts with a patch package's magic (`\x7FLIH`); `false` when it can't be read.
+pub fn is_patch(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok_and(|()| lih::is_lih(&magic))
+}
+
+/// What a package says about itself from its header and container alone (a few KiB): the
+/// image is never opened and a patch's blocks are not placed, so listing packages stays cheap.
+#[derive(Debug, Clone)]
+pub struct Peek {
+    /// A patch package (`\x7FLIH`); its container is the patched package's.
+    pub patch: bool,
+    pub content_id: String,
+    /// The container's content type (`0x20`/`0x26` a game, `0x21` additional content).
+    pub content_type: u32,
+    /// The container's plaintext `param.json`, when it carries one of at most `max_param` bytes.
+    pub param_json: Option<Vec<u8>>,
+    /// The size of the container's plaintext `icon0.png`, when it carries one.
+    pub icon0_size: Option<u64>,
+}
+
+/// [`Peek`] at the package `path`. Errors as [`FpkgSource::open`] does for its header and
+/// container (not a PS5 package, retail, corrupt).
+pub fn peek(path: &Path, max_param: u64) -> Result<Peek> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut pkg = Pkg::new(Box::new(file), len);
+    let mut magic = [0u8; 4];
+    if len >= 4 {
+        pkg.read_at(0, &mut magic)?;
+    }
+    let patch = lih::is_lih(&magic);
+    let cnt_offset = if patch {
+        lih::container_at(&mut pkg)?
+    } else {
+        pfs::header(&mut pkg)?.cnt_offset
+    };
+    let cnt = pfs::container(&mut pkg, cnt_offset)?;
+    // As the merge reads them: an empty slot or a protected (encrypted) entry is no file.
+    let plain = |id| {
+        cnt.entry(id)
+            .filter(|e| e.size > 0 && e.flags1 & 0x8000_0000 == 0)
+    };
+    let param_json = match plain(ids::PARAM_JSON).filter(|e| e.size <= max_param) {
+        Some(e) => {
+            let mut bytes = vec![0u8; e.size as usize];
+            pkg.read_at(e.at, &mut bytes)?;
+            Some(bytes)
+        }
+        None => None,
+    };
+    Ok(Peek {
+        patch,
+        content_type: cnt.content_type,
+        icon0_size: plain(ids::ICON0_PNG).map(|e| e.size),
+        content_id: cnt.content_id,
+        param_json,
+    })
 }
 
 impl SourceTree for FpkgSource {
@@ -418,6 +596,11 @@ impl SourceTree for FpkgSource {
         match self.places[i] {
             Where::Inner(at) => self.reader.mount(at + offset, &mut buf)?,
             Where::Container(at) => self.reader.outer.pkg.read_at(at + offset, &mut buf)?,
+            // `size` is the plaintext's length, so the range is inside it.
+            Where::Held(h) => {
+                let from = offset as usize;
+                buf.copy_from_slice(&self.held[h][from..from + n]);
+            }
         }
         Ok(buf)
     }
@@ -431,23 +614,21 @@ impl SourceTree for FpkgSource {
     }
 }
 
+/// ` (a, b, … and N more)` for a list's first ten; empty for none.
+fn first_ten(items: &[String]) -> String {
+    match items.len() {
+        0 => String::new(),
+        n if n <= 10 => format!(" ({})", items.join(", ")),
+        n => format!(" ({} and {} more)", items[..10].join(", "), n - 10),
+    }
+}
+
 /// Why a native image's inode table did not decrypt. The container's entry-keys slot carries
 /// `SHA3(k) ^ k` for each passcode-derived key `k` (slot 1 is the image key), which tests the
 /// passcode without touching the image.
 fn native_failure(outer: &mut Outer, cnt: &pfs::Container, passcode: &str) -> Result<Error> {
-    let check = match cnt.entry(ids::ENTRY_KEYS).filter(|e| e.size >= 96) {
-        Some(e) => {
-            let mut stored = [0u8; 32];
-            outer.pkg.read_at(e.at + 64, &mut stored)?;
-            let key = derive_pfs_key(&cnt.content_id, passcode, 1);
-            let mut want = sha3(&key);
-            for (w, k) in want.iter_mut().zip(key) {
-                *w ^= k;
-            }
-            Some(stored == want)
-        }
-        None => None,
-    };
+    let key = derive_pfs_key(&cnt.content_id, passcode, 1);
+    let check = protected::key_check(&mut outer.pkg, cnt, &key, 1)?;
     Ok(match check {
         Some(false) => err(
             WRONG_PASSCODE,

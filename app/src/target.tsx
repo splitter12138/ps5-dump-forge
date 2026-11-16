@@ -1,26 +1,31 @@
-// Pieces of a Target card that Convert and LZ4 share: format copy, the per-format settings,
+// Pieces of a Target card that Convert and Pack share: format copy, the per-format settings,
 // Full verification, and the output name (generated or typed) with its folder.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
-import { api, errorText, pick, type Format, type InnerFormat, type KrakenLevel } from "./api";
+import { api, errorText, pick, type Format, type InnerFormat, type KrakenLevel, type PackKind } from "./api";
 import {
   basename,
   dirname,
   FormatPicker,
   IMAGE_EXTENSIONS,
   isPasswordRequired,
+  isNetwork,
   joinPath,
   kindLabel,
   Prose,
   SEPARATORS,
+  useDeviceName,
+  usePeerPath,
 } from "./common";
+import { useConnectState } from "./useConnectState";
 import { msg, useMessages } from "./i18n";
+import { getNaming, render, subscribeNaming, template } from "./naming";
 import type { Messages } from "./locales/en";
 import { Icon, type IconName } from "./icons";
 import type { Job } from "./jobs";
 
-/** A one-line note; `tone`: its first word ("Recommended", "Experimental") is coloured. */
+/** A one-line note; `tone`: its first word ("Recommended", "Some") is coloured. */
 export interface Note {
   tone?: "good" | "warn";
   text: string;
@@ -32,7 +37,7 @@ export function formatInfo(f: Format): Note {
 }
 
 /** A note with its leading word in green (`good`: "Recommended") or amber (`warn`:
- * "Experimental"); text colour only, the word itself says it. */
+ * "Some"); text colour only, the word itself says it. */
 export function Lead({ note }: { note: Note }) {
   const word = note.tone ? /^[\p{L}\p{M}]+/u.exec(note.text)?.[0] : undefined;
   if (!word) return <Prose text={note.text} />;
@@ -47,10 +52,10 @@ export function Lead({ note }: { note: Note }) {
 /** The image a `.ffpfsc` holds, in picker order. */
 const INNER_FORMATS: InnerFormat[] = ["exfat", "ffpkg", "ffpfs"];
 
-/** One line under the inner-image picker: the format's own line, less what a `.ffpfsc` (always
- * mounted read-only) doesn't give. */
+/** One line under the inner-image picker: exfat (the UI's default) recommended, ffpkg its own line
+ * less what a `.ffpfsc` (always mounted read-only) doesn't give, ffpfs its format line. */
 function innerInfo(f: InnerFormat, t: Messages["target"]): Note {
-  return f === "ffpkg" ? t.innerFfpkg : t.format[f];
+  return f === "exfat" ? t.innerExfat : f === "ffpkg" ? t.innerFfpkg : t.format[f];
 }
 
 /** The `.ffpfsc` zlib level a new window starts on. */
@@ -73,17 +78,6 @@ const KRAKEN_ICON: Record<KrakenLevel, IconName> = {
   smallest: "compress",
   stored: "file",
 };
-
-/** The `.fpkg` firmware limit, under the format's one-liner. */
-export function PkgWarning() {
-  const t = useMessages().target;
-  return (
-    <p className="alert-bar warn">
-      <Icon name="warn" />
-      <span>{t.pkgFirmware}</span>
-    </p>
-  );
-}
 
 /** `.ffpfsc`: the image inside and the zlib level. `prefix` keeps ids and radio names apart
  * per screen. */
@@ -114,7 +108,10 @@ export function FfpfscField(props: {
       </p>
       <label className="label range-label" htmlFor={`${props.prefix}-ffpfsc-level`}>
         <span>{t.compressionLevel}</span>
-        <span className="range-value">{props.level}</span>
+        {/* The slider says its value itself: kept out of its name. */}
+        <span className="range-value" aria-hidden="true">
+          {props.level}
+        </span>
       </label>
       <input
         id={`${props.prefix}-ffpfsc-level`}
@@ -196,6 +193,40 @@ export function VerifySwitch(props: {
   );
 }
 
+/** Delete the source once the job is Ok (output verified and in place); off by default, in memory
+ * only. `nas`: a NAS's game can't be deleted from here, so the switch is off with the reason. */
+export function DeleteSourceSwitch(props: {
+  checked: boolean;
+  onChange: (on: boolean) => void;
+  nas: boolean;
+}) {
+  const t = useMessages().target;
+  return (
+    <div className="field verify delete-source">
+      <label className="switch">
+        <input
+          type="checkbox"
+          className="visually-hidden"
+          checked={props.checked && !props.nas}
+          disabled={props.nas}
+          onChange={(e) => props.onChange(e.target.checked)}
+        />
+        <span className="switch-track" aria-hidden="true" />
+        <span>
+          {t.deleteSource}
+          {!props.nas && <span className="muted hint">{t.deleteSourceHint}</span>}
+        </span>
+      </label>
+      {props.nas && (
+        <p className="note-line warn">
+          <Icon name="warn" />
+          <span>{t.deleteSourceNas}</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** Extensions a typed name can end in: the real ones, plus "fpkg", the debug package's label. */
 const TYPED_EXTENSIONS = [...IMAGE_EXTENSIONS, "fpkg"];
 
@@ -247,25 +278,46 @@ function checkName(name: string, format: Format): { name: string; error?: string
   return error ? { name, error } : { name: saved };
 }
 
-/** Where unfinished jobs will publish: taken for a generated name. */
+/** Where unfinished jobs will publish: taken for a generated name. A transfer publishes each
+ * source under its name in its folder (core's `transfer::targets`). */
 export function running(jobs: Job[]): string[] {
-  return jobs.flatMap((j) => (j.request && !j.result ? [j.request.output] : []));
+  return jobs.flatMap((j) => {
+    const r = j.request;
+    if (!r || j.result) return [];
+    if (r.extract?.length) return r.extract.map((p) => joinPath(r.output, p.split("/").pop() || ""));
+    if (!r.transfer?.length) return [r.output];
+    return r.transfer.map((s) => (basename(s) ? joinPath(r.output, basename(s)) : r.output));
+  });
+}
+
+/** The generated names' template (About's Output names): re-renders when it changes. */
+export function useNaming(): string {
+  return useSyncExternalStore(subscribeNaming, getNaming);
 }
 
 /**
- * The output of a screen's job: a generated name (`[GAME_NAME]-[TITLE_ID]`, the next free one)
- * or a typed one, in a folder that starts as the source's. `format` is the target this render
- * shows; calls made right after a source or format change pass the new ones themselves.
+ * The output of a screen's job: a generated name (About's naming template, `{pack}` the zstd or
+ * LZ4 of a Pack job's `pack`; the next free one) or a typed one, in a folder
+ * that starts as the source's. `format` and `pack` are what this render shows; calls made right
+ * after a source, format or kind change pass the new ones themselves.
  */
-export function useOutput(format: Format, jobs: Job[], onError: (e: string) => void) {
+export function useOutput(
+  format: Format,
+  jobs: Job[],
+  onError: (e: string | null) => void,
+  pack: PackKind | null = null,
+  active = true,
+) {
   useMessages().target; // the typed name's error is in the current language
   const [output, setOutput] = useState("");
   const [generate, setGenerate] = useState(true);
   // The latest naming failed (the error went to `onError`): the box stops saying "Naming".
   const [failed, setFailed] = useState(false);
+  // The error `onError` shows is a naming one: a later name that works takes it back.
+  const namingError = useRef(false);
   // Only the latest output request may land.
   const outputSeq = useRef(0);
-  // Bumped when the source, format or naming changes: a file dialog opened before that is
+  // Bumped when the source or format changes: a file dialog opened before that is
   // answered for a choice that no longer stands, so its result is dropped.
   const choiceSeq = useRef(0);
   // The output's folder, kept while a new name is pending (output is empty then).
@@ -275,25 +327,58 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string) => v
   // This render's naming, for `opened`, which lands after an inspection began on an older render.
   const live = useRef({ generate, typed: false });
   live.current = { generate, typed: !generate && output !== "" };
+  // The pack kind names use: this render's, or one a call below was just given.
+  const packRef = useRef(pack);
+  packRef.current = pack;
+
+  // The source and target the last name was asked for: made again when the naming changes
+  // (null while the source can't be named yet).
+  const lastNamed = useRef<{ src: string; fmt: Format } | null>(null);
 
   // Recompute the name, keeping the folder.
-  const refresh = async (src: string, fmt: Format, gen = generate, taken = running(jobs)) => {
+  // The latest jobs, for a callback from an older render (an inspection or start that lands late):
+  // a job added since must count as taken.
+  const jobsNow = useRef(jobs);
+  jobsNow.current = jobs;
+  const refresh = async (src: string, fmt: Format, gen = generate, taken = running(jobsNow.current)) => {
+    lastNamed.current = { src, fmt };
     const seq = ++outputSeq.current;
     setFailed(false);
     try {
       const out = gen
-        ? await api.generatedOutput(src, fmt, outDir.current, taken, password.current)
+        ? await api.generatedOutput(src, fmt, outDir.current, taken, password.current, packRef.current, template(getNaming()))
         : await api.defaultOutput(src, fmt, outDir.current, password.current);
       if (seq !== outputSeq.current) return;
       if (out) outDir.current = dirname(out);
       setOutput(out);
+      if (namingError.current) {
+        namingError.current = false;
+        onError(null);
+      }
     } catch (e) {
       // A locked archive: the screen asks for its password, then `opened` names it.
       if (seq !== outputSeq.current) return;
       setFailed(true);
-      if (!isPasswordRequired(errorText(e))) onError(errorText(e));
+      if (!isPasswordRequired(errorText(e))) {
+        namingError.current = true;
+        onError(errorText(e));
+      }
     }
   };
+
+  // About's naming changed: a generated name is made again (a typed one stays), only while this
+  // tab shows: a hidden one does it once when shown again, as each name reads the source (idea
+  // from PR #39).
+  const naming = useNaming();
+  const namingSeen = useRef(naming);
+  useEffect(() => {
+    if (naming === namingSeen.current || !active) return;
+    namingSeen.current = naming;
+    const last = lastNamed.current;
+    if (!live.current.generate || !last) return;
+    setOutput("");
+    void refresh(last.src, last.fmt, true);
+  }, [naming, active]);
 
   // The name part: a typed name keeps whatever the user typed (separators included, which
   // `checkName` refuses), so the folder is never taken from typing.
@@ -307,6 +392,8 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string) => v
     output,
     failed,
     dir: outDir.current,
+    /** This render's pack kind: its part shows in the name pattern. */
+    pack,
     name,
     named,
     /** The path a job writes: empty while a name is pending. */
@@ -317,23 +404,30 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string) => v
       choiceSeq.current++;
       outputSeq.current++;
       password.current = null;
-      outDir.current = dirname(src);
+      lastNamed.current = null;
+      // A source on another device: the user picks the output folder (core says so until then).
+      outDir.current = isNetwork(src) ? "" : dirname(src);
       setOutput("");
       setFailed(false);
       if (fmt) void refresh(src, fmt);
     },
     /** The source opened, with `pw` (an archive's password, or null): names use it from now
-     * on; a fresh name for `fmt` now (none when null, or when a name was typed meanwhile). */
-    opened(src: string, fmt: Format | null, pw: string | null) {
+     * on; a fresh name for `fmt` (and `pk`, when given) now (none when null, or when a name was
+     * typed meanwhile). */
+    opened(src: string, fmt: Format | null, pw: string | null, pk?: PackKind | null) {
       password.current = pw;
+      if (pk !== undefined) packRef.current = pk;
+      if (!fmt) lastNamed.current = null;
       if (!fmt || live.current.typed) return;
       outputSeq.current++;
       setOutput("");
       void refresh(src, fmt, live.current.generate);
     },
-    /** A new target: a typed name keeps its stem, a generated one is made again. */
-    retarget(src: string | null, fmt: Format) {
+    /** A new target (and pack kind `pk`, when given): a typed name keeps its stem, a generated
+     * one is made again. */
+    retarget(src: string | null, fmt: Format, pk?: PackKind | null) {
       choiceSeq.current++;
+      if (pk !== undefined) packRef.current = pk;
       if (!src) return;
       if (!generate && name) {
         const dot = name.lastIndexOf(".");
@@ -365,7 +459,9 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string) => v
       const t = msg().target;
       const title = FOLDER_FORMATS.includes(format) ? t.extractInto : t.saveInto;
       // Opens at the output's folder, not wherever the last browse ended (the game's own folder).
-      const dir = await pick({ directory: true, title, start: outDir.current || undefined });
+      // A paired Forge takes any output, an fpkg included (the builder writes through the peer);
+      // an FTP server takes all but an fpkg (it goes back over what it wrote).
+      const dir = await pick({ directory: true, title, start: outDir.current || undefined, devices: true });
       if (dir === null || choice !== choiceSeq.current) return;
       outDir.current = dir;
       if (!generate && name) {
@@ -390,14 +486,28 @@ export type Output = ReturnType<typeof useOutput>;
 
 /** The Output box: the generated name whole, or the typed one; its folder on the line below. */
 export function OutputField(props: { out: Output; source: string | null; prefix: string }) {
-  const t = useMessages().target;
+  const m = useMessages();
+  const t = m.target;
   const { out, source } = props;
   const id = `${props.prefix}-output`;
+  // Which device the output goes to: a paired one by name, else this one (named only while
+  // there are devices to tell apart). Its folder below reads "<device>: /<path>" too.
+  const shown = usePeerPath();
+  const peer = useDeviceName()(out.dir);
+  const saved = useConnectState().state;
+  const paired = (saved?.devices.length ?? 0) + (saved?.nas.length ?? 0) > 0;
   return (
     <div className="field" role="group" aria-labelledby={`${id}-label`}>
       <div className="label-row">
-        <span className="label" id={`${id}-label`}>
-          {t.output}
+        <span className="label-group">
+          <span className="label" id={`${id}-label`}>
+            {t.output}
+          </span>
+          {source && out.dir && (peer || paired) && (
+            <span className={peer ? "tag green" : "tag"} title={peer ?? undefined}>
+              {peer ?? m.picker.thisDevice}
+            </span>
+          )}
         </span>
         <button className="small" onClick={() => void out.choose(source)} disabled={!source}>
           {t.change}
@@ -425,6 +535,8 @@ export function OutputField(props: { out: Output; source: string | null; prefix:
           placeholder={source ? t.fileName : t.chooseSourceFirst}
           disabled={!source}
           spellCheck={false}
+          autoCapitalize="none"
+          autoCorrect="off"
         />
       )}
       {out.named.error && (
@@ -432,9 +544,11 @@ export function OutputField(props: { out: Output; source: string | null; prefix:
           <Prose text={out.named.error} />
         </p>
       )}
-      {source && (
+      {source && out.dir && (
         <p className="out-dir path" id={`${id}-dir`}>
-          {out.named.name !== out.name && !out.named.error ? t.savedAs(out.named.name, out.dir) : t.inDir(out.dir)}
+          {out.named.name !== out.name && !out.named.error
+            ? t.savedAs(out.named.name, shown(out.dir))
+            : t.inDir(shown(out.dir))}
         </p>
       )}
     </div>
@@ -443,8 +557,12 @@ export function OutputField(props: { out: Output; source: string | null; prefix:
 
 /** "Generate name based on content", in the build row. */
 export function GenerateSwitch(props: { out: Output; source: string | null }) {
-  const t = useMessages().target;
+  const m = useMessages();
+  const t = m.target;
   const { out } = props;
+  const naming = useNaming();
+  // The template in this language's part names; the pack kind only where the job packs.
+  const pattern = render(naming, (p) => (p === "pack" && !out.pack ? "" : m.naming.parts[p]));
   return (
     <label className="switch">
       <input
@@ -457,7 +575,8 @@ export function GenerateSwitch(props: { out: Output; source: string | null }) {
       <span>
         {t.generate}
         {/* When on, the Output box shows the generated name itself. */}
-        {!out.generate && <span className="muted mono hint">{t.generatePattern}</span>}
+        {/* LTR: the template's order, part names included, in every language. */}
+        {!out.generate && <span className="muted mono hint" dir="ltr">{pattern}</span>}
       </span>
     </label>
   );

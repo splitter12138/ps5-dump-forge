@@ -13,15 +13,25 @@ const CHECKS = { one: "verificação", many: "verificações", other: "verifica�
 const pt: Messages = {
   // App.tsx
   app: {
-    address: (url) => `Endereço: ${url}. Mostrar como conectar, com um QR code`,
     screens: "Telas",
     convert: "Converter",
     active: (n) => `, ${num(n)} ${plural(n, { one: "ativa", many: "ativas", other: "ativas" })}`,
-    inspect: "Inspecionar",
-    library: "Biblioteca",
+    edit: "Editar",
+    pack: "Empacotar",
+    storage: "Armazenamento",
+    connect: "Conectar",
+    disconnected: "Desconectado",
+    connected: (n: number) =>
+      plural(n, {
+        one: `Conectado (${num(n)} dispositivo)`,
+        many: `Conectado (${num(n)} dispositivos)`,
+        other: `Conectado (${num(n)} dispositivos)`,
+      }),
     about: "Sobre",
+    prevTab: "Aba anterior (L2)",
+    nextTab: "Próxima aba (R2)",
     offline: "Sem conexão, tentando de novo…",
-    stop: "Parar o Dump Forge",
+    stop: "Parar",
     stillRunning: (n) =>
       n === 1 ? "Uma tarefa ainda está em execução" : `${num(n)} tarefas ainda estão em execução`,
     job: (id) => `Tarefa ${id}`,
@@ -37,6 +47,7 @@ const pt: Messages = {
     stopAndQuit: (n) => (n === 1 ? "Parar a tarefa e sair" : "Parar as tarefas e sair"),
     stoppingJobs: "Parando as tarefas e limpando…",
     stoppingForge: "Parando o Dump Forge…",
+    quitting: "Saindo do PS5 Dump Forge…",
     couldntStop: "Não foi possível parar o Dump Forge",
     close: "Fechar",
     tryAgain: "Tentar de novo",
@@ -44,6 +55,7 @@ const pt: Messages = {
     startAgain: (ps5) => (ps5 ? "Para continuar, abra de novo o bloco do Dump Forge no PS5." : "Para continuar, execute de novo o mesmo comando ps5-dump-forge serve."),
     confirmStop: (web: boolean) => (web ? "Parar o Dump Forge?" : "Sair do PS5 Dump Forge?"),
     stopNote: (web, ps5) => (!web ? "Nenhuma tarefa em andamento." : ps5 ? "Para iniciá-lo de novo, abra o bloco do Dump Forge no PS5." : "Para iniciá-lo de novo, execute outra vez o mesmo comando ps5-dump-forge serve."),
+    peerBusy: "Um dispositivo pareado está lendo ou gravando arquivos neste computador. Sair interrompe a transferência dele.",
     quit: "Sair",
     github: (name) => `${name} no GitHub`,
     queued: "na fila",
@@ -55,14 +67,20 @@ const pt: Messages = {
     targetFormat: "Formato de destino",
     alreadyFolder: "a origem já é uma pasta",
     lz4Backport:
-      "Os assets deste jogo estão empacotados com LZ4 e o manifesto LZ4 inclui o backport: desempacote o jogo na aba “LZ4” primeiro e depois remova o backport aqui.",
+      "Os assets deste jogo estão empacotados com LZ4 e o manifesto LZ4 inclui o backport: desempacote o jogo na aba “Empacotar” primeiro e depois remova o backport aqui.",
+    zstdBackport:
+      "Os assets deste jogo estão empacotados com zstd e o índice zstd inclui o backport: desempacote o jogo na aba “Empacotar” primeiro e depois remova o backport aqui.",
     unreadable: "Não é possível criar: esta origem não pôde ser lida (veja “Origem”).",
+    patchBlocked: "Não é possível criar: este é um pacote de patch, que contém só o que a atualização mudou. Abra-o em “Editar” para extrair os arquivos.",
+    openInEdit: "Abrir em “Editar”",
     noContentId: "Não é possível criar como fpkg: o param.json deste jogo não tem Content ID, que um pacote exige.",
     blocked: (first, more) =>
       `Não é possível criar: ${first}${more > 0 ? ` (e mais ${num(more)}, veja “Origem”)` : ""}.`,
+    amprZstdRuntime: "Esta conversão instala o ampr-emu-ng em fakelib/libSceAmpr.sprx, necessário para estes pacotes.",
+    amprNgReplaced: (version) => `Substitui o ampr-emu-ng deste jogo pelo ampr_emu ${version}.`,
     amprRuntime: (a, own, version) => {
       if (a === "install") return `Este jogo usa AMPR, mas não tem ampr_emu: a conversão instala o ampr_emu ${version} incluído.`;
-      if (a === "trace") return `A conversão troca o runtime de rastreamento do LZ4 pelo ampr_emu ${version} de release incluído.`;
+      if (a === "trace") return `A conversão troca o ampr_emu deste jogo pelo ampr_emu ${version} incluído.`;
       if (a === "replace")
         return own
           ? `A conversão troca o ampr_emu ${own} deste jogo pelo ampr_emu ${version} incluído.`
@@ -71,10 +89,9 @@ const pt: Messages = {
         ? `O ampr_emu ${own} deste jogo é igual ou mais novo que o ${version} incluído: a conversão o mantém.`
         : `Este jogo já tem o ampr_emu ${version} incluído: a conversão o mantém.`;
     },
-    amprIndex: (state, traces) =>
-      `${state === "stale" ? "O ampr_emu.index não lista os arquivos deste jogo" : state === "damaged" ? "Não dá para ler o ampr_emu.index" : "Este jogo não tem ampr_emu.index"}: a conversão grava um novo${traces ? " e deixa de fora os rastreamentos antigos" : ""}.`,
-    amprPkgIndex: (traces) =>
-      `O pacote recebe um ampr_emu.index novo, gerado a partir dos arquivos dele${traces ? ", sem os rastreamentos antigos" : ""}.`,
+    amprIndex: (state: "stale" | "damaged" | "missing") =>
+      `${state === "stale" ? "O ampr_emu.index não lista os arquivos deste jogo" : state === "damaged" ? "Não dá para ler o ampr_emu.index" : "Este jogo não tem ampr_emu.index"}: a conversão grava um novo.`,
+    amprPkgIndex: "O pacote recebe um ampr_emu.index novo, gerado a partir dos arquivos dele.",
     removeBackport: "Remover backport",
     removeHint: (libs, emulators, other) =>
       `Omite de fakelib/ ${num(libs)} ${plural(libs, { one: "biblioteca", many: "bibliotecas", other: "bibliotecas" })} de backport` +
@@ -107,64 +124,62 @@ const pt: Messages = {
         tagline: "O melhor, se o firmware permitir",
         cells: ["Nativa, velocidade total", "30–60% menor, dependendo do jogo"],
       },
+      zstd: { tagline: "Com ampr-emu-ng", cells: ["Carregamento até 80% mais rápido", "Até metade do tamanho do jogo"] },
       lz4: {
-        tagline: "Experimental, para jogos que usam AMPR",
+        tagline: "Com ampr-emu-ng ou ampr_emu",
         cells: ["Carregamento 30–40% mais rápido, segundo os autores", "Cerca de metade do tamanho do jogo, segundo os autores"],
       },
       ffpkg: { tagline: "Recomendado para o ShadowMountPlus", cells: ["Velocidade total de imagem", FLAT] },
       exfat: { tagline: "Compatibilidade", cells: ["Velocidade total de imagem", FLAT] },
-      ffpfs: { tagline: "Experimental", cells: ["Velocidade total de imagem", FLAT] },
+      ffpfs: { tagline: "PFS sem compressão", cells: ["Velocidade total de imagem", FLAT] },
       ffpfsc: {
-        tagline: "O menor, experimental",
+        tagline: "O menor",
         cells: ["150–250 MB/s, pode engasgar", "Depende do nível de compressão, geralmente 30–60% menor"],
       },
       folder: { tagline: "Arquivos comuns do jogo", cells: ["Velocidade total da unidade", FLAT] },
     },
     features: [
       ["Converter", "entre pasta, ffpkg, exfat, ffpfs, ffpfsc e fpkg, nos dois sentidos."],
-      ["Inspecionar", "a capa, o firmware, o backport, os DLCs e os problemas de nomes de arquivo de um jogo antes de criar."],
-      ["Verificar", "cada saída depois da gravação: uma amostra rápida por padrão, cada byte se você pedir."],
-      ["Excluir", "um jogo do disco, depois da sua confirmação."],
-      ["LZ4", "rastrear um jogo AMPR e depois empacotar os assets dele (experimental)."],
-      ["Runtime AMPR", "cada conversão instala ou atualiza o ampr_emu do jogo (um igual ou mais novo fica) e renova um ampr_emu.index desatualizado."],
-      ["Payload para PS5", "o mesmo app no console, aberto de qualquer dispositivo da sua rede."],
+      ["Transferência", "enviar arquivos e converter jogos entre o seu PS5, computadores e um NAS via SMB, FTP ou NFS."],
+      ["Editar", "os arquivos de um jogo como uma pasta e ver a capa, o firmware, o backport, os DLCs e os problemas de nomes de arquivo antes de criar."],
+      ["Em streaming", "de qualquer origem para qualquer destino: sem cópia temporária, nem para a imagem dentro de um ffpfsc ou um jogo em um arquivo compactado."],
+      ["Arquivos compactados", "um .zip, .7z ou .rar com um jogo é explorado, convertido ou empacotado como uma pasta."],
+      ["USB e cartões SD", "gravado em pendrives e cartões formatados em exFAT ou FAT32."],
+      ["Empacotar", "pacotes de assets zstd ou LZ4 com reparo inteligente."],
+      ["Armazenamento", "uma Biblioteca dos seus jogos e um Explorador de arquivos para renomear, mover e excluir."],
+      ["Seguro", "seu jogo nunca é alterado a menos que você peça; arquivos inúteis são ignorados e nomes de arquivo inválidos são avisados antes."],
     ],
-    howToConnect: "Como conectar",
-    connectText: (url) => (
-      <>Abra {url} em um navegador de qualquer dispositivo da sua rede local ou escaneie este código.</>
-    ),
-    close: "Fechar",
     about: "Sobre",
-    aboutText: "Esta ferramenta converte um jogo de qualquer formato para qualquer outro, em qualquer plataforma, inclusive no PS5.",
-    connectAny: "Como conectar de qualquer dispositivo",
-    useAddress: (url) => <>Use {url} ou escaneie este código.</>,
     compare: "Comparar formatos",
     compareLabel: "Comparação de formatos",
     format: "Formato",
+    credits: "Créditos",
     upstream: (app) =>
       `Números dos autores: o que os autores do ampr_emu e do Lazy_AMPR relatam, sem medição do ${app}; variam de jogo para jogo. O ampr_emu 0.4.2.1 é uma versão de teste dos autores; problema conhecido: alguns jogos travam ao salvar.`,
     bundled: "Pastas empacotadas com LZ4 rodam no ampr_emu 0.4.2.1 de drakmor (GPL-3.0), incluído sem modificações. Código-fonte:",
-    lazy: "O fluxo “rastrear e depois empacotar” segue o Lazy_AMPR de Nazky:",
+    lazy: "A estratégia de empacotamento se baseia no Lazy_AMPR de Nazky:",
+    ng: "Os pacotes zstd e LZ4 rodam no ampr-emu-ng. Código-fonte:",
+    logo: "O logotipo é de Xxcco:",
     unrar:
       "Arquivos .rar são lidos com a biblioteca UnRAR incluída, de Alexander Roshal (só extração, sob a licença do UnRAR).",
     language: "Idioma",
     system: "Sistema",
+    notifications: "Avisar quando uma tarefa terminar",
+    notificationsHint: "Aparece no console para tarefas de conversão, empacotamento e transferência.",
+    notificationsFailed: "Não foi possível alterar as notificações.",
   },
-  // Inspect.tsx
-  inspect: {
-    files: "Arquivos",
+  // Edit.tsx
+  edit: {
     details: "Detalhes",
-    deleting: "Excluindo a origem…",
+    deleting: "Excluindo a origem",
     delete: "Excluir a origem",
     deleted: "Excluído:",
-    contents: "Conteúdo da origem",
     filter: "Filtrar por caminho",
     filterLabel: "Filtrar arquivos por caminho",
     firstOf: (max, n) => `exibindo ${num(max)} de ${num(n)}, a partir do início`,
     fileCount: (n) => `${num(n)} ${plural(n, FILES)}`,
     noMatch: (f) => `Nenhum arquivo corresponde a “${f}”.`,
     noListing: "A lista de arquivos do arquivo compactado não é suportada.",
-    emptyDirs: (n) => `Pastas vazias (${num(n)})`,
     noParam: "Sem sce_sys/param.json.",
     reader: "Leitor",
     leftovers: "Arquivos e pastas restantes",
@@ -172,6 +187,159 @@ const pt: Messages = {
     leftoversNote: (app) =>
       `Saídas incompletas, geralmente de tarefas interrompidas. Remova só as que você reconhecer, e só quando nenhuma tarefa estiver em execução; o ${app} nunca as exclui sozinho.`,
     checked: (n) => `Pastas verificadas (${num(n)})`,
+    /** Edit's folds under the game card. */
+    facts: "Informações do jogo",
+    explorer: "Arquivos do jogo",
+    howTitle: "Como funciona",
+    /** The empty state's paragraphs. */
+    how: (app) => [
+      "Abra a **pasta** ou a **imagem** de um jogo e altere-a como uma pasta num pendrive: **adicione e substitua arquivos** (arraste-os ou use “Adicionar”), **renomeie e exclua**.",
+      `Nada muda **até você clicar em “Aplicar”**: suas alterações se acumulam aqui e então o ${app} as grava direto na imagem ou na pasta, de uma só vez, e verifica o resultado. **Não é uma unidade montada**: o ${app} registra suas alterações e as aplica ele mesmo.`,
+      `Quando as alterações cabem, vão **direto para a imagem**; quando não cabem (sem espaço livre dentro dela, ou num formato que não as aceita), o ${app} cria ao lado uma nova imagem com suas alterações e a coloca no lugar depois de verificá-la. Em qualquer caso, se algo falhar, a imagem fica como estava.`,
+      "Arquivos compactados podem ser navegados, mas não editados.",
+    ],
+    location: "Local no jogo",
+    root: "Jogo",
+    up: "Acima",
+    upTip: "Subir uma pasta",
+    name: "Nome",
+    size: "Tamanho",
+    actions: "Ações",
+    items: (n) => `${num(n)} ${plural(n, { one: "item", many: "itens", other: "itens" })}`,
+    inFolder: (dirs, files) =>
+      `${num(dirs)} ${plural(dirs, { one: "pasta", many: "pastas", other: "pastas" })}, ${num(files)} ${plural(files, FILES)}`,
+    matches: (n) => `${num(n)} ${plural(n, { one: "resultado", many: "resultados", other: "resultados" })}`,
+    emptyFolder: "Esta pasta está vazia.",
+    open: (name) => `Abrir ${name}`,
+    archiveNote: "Arquivos compactados podem ser navegados, mas não editados. Para alterá-lo, converta-o antes em uma pasta ou imagem.",
+    nasNote: "Jogos em um NAS podem ser navegados e extraídos, mas não editados. Para alterá-lo, converta-o ou extraia-o para este dispositivo primeiro.",
+    patchNote: "Este é um pacote de patch: contém só o que a atualização mudou. Os arquivos que ele contém por inteiro são listados; podem ser navegados e extraídos, mas não editados.",
+    peerNote: "Jogos em outro Forge podem ser navegados e extraídos, mas não editados. Para alterá-lo, converta-o ou extraia-o para este dispositivo primeiro.",
+    /** The explorer's changes: none is made until Apply. */
+    addFiles: "Adicionar arquivos",
+    addFolder: "Adicionar pasta",
+    pickAddFiles: "Escolha os arquivos a adicionar",
+    pickAddFolder: "Escolha uma pasta a adicionar",
+    peerRoot: "Não é possível adicionar um dispositivo inteiro: escolha uma pasta dentro dele.",
+    renameItem: (name) => `Renomear ${name}`,
+    removeItem: (name) => `Excluir ${name}`,
+    renameTip: "Renomear (F2)",
+    removeTip: "Excluir (tecla Delete)",
+    removeTipMac: "Excluir (teclas fn+Apagar)",
+    /** Extract: copy files or folders out of the source into a folder chosen on this machine. */
+    extractItem: (name: string) => `Extrair ${name}`,
+    extractTip: "Copiar para uma pasta que você escolher",
+    extractFolder: "Extrair pasta",
+    extractFolderTip: "Copiar a pasta exibida para uma pasta que você escolher",
+    extractGameTip: "Copiar o jogo inteiro para uma pasta que você escolher",
+    extractNotOnDisk: "Esta pasta só existe nas suas alterações pendentes: aplique-as para extraí-la.",
+    pickExtract: "Escolha onde extrair",
+    extractPending: "Extrai os arquivos como estão agora, sem as suas alterações pendentes.",
+    nameEmpty: "Digite um nome.",
+    nameBad: "Um nome não pode conter / ou \\, nem ser . ou ..",
+    nameTaken: (name) => `${name} já existe aqui.`,
+    markNew: "Novo",
+    markReplaced: "Substituído",
+    markRenamed: "Renomeado",
+    wasAt: (path) => `Antes em ${path}`,
+    sizeLater: "Mais do que foi possível listar: o restante é lido quando as alterações forem aplicadas",
+    dropInto: (folder) => `Solte para adicionar em ${folder}`,
+    droppedGone: (path) => `${path}: o arquivo arrastado não está mais disponível`,
+    pending: (n) =>
+      plural(n, {
+        one: `${num(n)} alteração ainda não aplicada`,
+        many: `${num(n)} alterações ainda não aplicadas`,
+        other: `${num(n)} alterações ainda não aplicadas`,
+      }),
+    undo: "Desfazer",
+    undoTip: "Desfazer a última ação, com todas as suas alterações",
+    discard: "Descartar tudo",
+    discardTip: "Esquecer todas as alterações ainda não aplicadas",
+    discardTitle: (n) =>
+      plural(n, { one: `Descartar ${num(n)} alteração?`, many: `Descartar todas as ${num(n)} alterações?`, other: `Descartar todas as ${num(n)} alterações?` }),
+    discardText: "Elas são esquecidas, e nada no jogo muda. Isso não pode ser desfeito.",
+    discardNo: "Não",
+    changesList: "Alterações, em ordem",
+    willNotApply: (n) =>
+      plural(n, {
+        one: `${num(n)} alteração não pode ser aplicada como está. Desfaça-a ou descarte tudo.`,
+        many: `${num(n)} alterações não podem ser aplicadas como estão. Desfaça-as ou descarte tudo.`,
+        other: `${num(n)} alterações não podem ser aplicadas como estão. Desfaça-as ou descarte tudo.`,
+      }),
+    opAdd: (to) => <>Adicionar {to}</>,
+    opAddFolder: (to) => <>Adicionar a pasta {to}</>,
+    opDelete: (path) => <>Excluir {path}</>,
+    opRename: (from, to) => <>Renomear {from} para {to}</>,
+    opMkdir: (path) => <>Nova pasta {path}</>,
+    opFrom: (src) => <>De {src}</>,
+    whyInvalid: (path) => <>{path} não é um caminho válido no jogo.</>,
+    whyMissing: (path) => <>{path} não está no jogo.</>,
+    whyExists: (path) => <>{path} já existe.</>,
+    whyFile: (path) => <>{path} é um arquivo.</>,
+    whyFolder: (path) => <>{path} é uma pasta.</>,
+    whyInto: (path) => <>{path} não pode ser movido para dentro de si mesmo.</>,
+    conflictTitle: (n) =>
+      plural(n, { one: `${num(n)} item já existe aqui`, many: `${num(n)} itens já existem aqui`, other: `${num(n)} itens já existem aqui` }),
+    conflictIn: (folder) => <>Em {folder}:</>,
+    conflictText:
+      "“Substituir” coloca os novos no lugar deles: depois que as alterações forem aplicadas, o conteúdo antigo se perde de vez, e um arquivo com problema pode impedir o jogo de iniciar. Uma pasta adicionada sobre outra pasta é mesclada, e os arquivos com o mesmo nome são substituídos.",
+    replace: "Substituir",
+    skip: "Pular",
+    cancel: "Cancelar",
+    /** How the changes go in (the pending bar), from core's check before Apply. */
+    modeLabel: "Como aplicar",
+    checking: "Verificando como as alterações podem ser aplicadas",
+    nothingToChange: "Nada a mudar: o jogo fica como está.",
+    checkFailed: "Não foi possível verificar as alterações:",
+    checkAgain: "Verificar de novo",
+    inPlace: "No local",
+    rebuild: "Recriar",
+    rebuildNeeded: "Precisa recriar",
+    cantApply: "Não é possível aplicar",
+    changedDirectly: "Alteração direta",
+    folderText: "Gravadas direto na pasta.",
+    inPlaceText: "Gravadas na imagem.",
+    inPlaceNeeds: (need, free) => `Gravadas na imagem; precisam de ${need} dos ${free} livres dela.`,
+    noRoom: (need, free) => `As alterações precisam de ${need}, e a imagem tem ${free} livres.`,
+    alwaysRebuilt: "Imagens ffpfsc e fpkg são sempre recriadas.",
+    rebuildText: "Uma nova imagem é gravada ao lado e a substitui depois de verificada.",
+    rebuildNeeds: (need, free) =>
+      `Uma nova imagem é gravada ao lado (são necessários cerca de ${need} livres; há ${free} livres) e a substitui depois de verificada.`,
+    uploadLater: (n) =>
+      plural(n, {
+        one: `${num(n)} arquivo deste navegador é verificado depois de enviado, quando você clicar em “Aplicar”.`,
+        many: `${num(n)} arquivos deste navegador são verificados depois de enviados, quando você clicar em “Aplicar”.`,
+        other: `${num(n)} arquivos deste navegador são verificados depois de enviados, quando você clicar em “Aplicar”.`,
+      }),
+    decidedOnApply: (n) =>
+      plural(n, {
+        one: "Outras alterações dependem do arquivo deste navegador, então a forma de aplicá-las é decidida depois que ele for enviado, quando você clicar em “Aplicar”.",
+        many: `Outras alterações dependem dos ${num(n)} arquivos deste navegador, então a forma de aplicá-las é decidida depois que eles forem enviados, quando você clicar em “Aplicar”.`,
+        other: `Outras alterações dependem dos ${num(n)} arquivos deste navegador, então a forma de aplicá-las é decidida depois que eles forem enviados, quando você clicar em “Aplicar”.`,
+      }),
+    sourceLocked: "As alterações estão sendo aplicadas a este jogo. Escolha outra origem quando a tarefa terminar.",
+    notOpened: (path) => <>{path} não foi aberto: as alterações estão sendo aplicadas a este jogo. Abra-o de novo quando a tarefa terminar.</>,
+    apply: "Aplicar",
+    applyTip: "Aplicar todas as alterações listadas aqui",
+    applyTitle: (n) =>
+      plural(n, { one: `Aplicar ${num(n)} alteração?`, many: `Aplicar ${num(n)} alterações?`, other: `Aplicar ${num(n)} alterações?` }),
+    applyInPlace: (name) => <>Elas são gravadas direto em {name}. Depois de concluído, não há como desfazer.</>,
+    applyRebuild: (name) => (
+      <>Uma nova imagem com suas alterações é gravada ao lado de {name}, verificada e então colocada no lugar dela. Depois que ela substituir a imagem, não há como desfazer.</>
+    ),
+    closeImage: "Se o jogo estiver rodando a partir desta imagem, feche-o antes.",
+    closeFolder: "Se o jogo estiver rodando a partir desta pasta, feche-o antes.",
+    applyRestores: "Uma edição anterior desta imagem foi interrompida: primeiro a imagem volta a ser como era.",
+    uploadingFile: (i, n) => `Enviando arquivo ${num(i)} de ${num(n)}`,
+    uploading: (i, n, sent, total) => `Enviando arquivo ${num(i)} de ${num(n)}: ${sent} de ${total}`,
+    uploadLabel: "Envio",
+    uploadCancelled: "Envio cancelado. Nada no jogo mudou.",
+    applyRunning: "Aplicando as alterações. A edição fica em espera até a tarefa abaixo terminar.",
+    applyFailed: "As alterações não foram aplicadas:",
+    applyRefused: "As alterações não podem ser aplicadas desta forma:",
+    applyCancelled: "A tarefa foi cancelada. Suas alterações continuam listadas aqui.",
+    folderPartly: "Parte delas pode já estar na pasta: os arquivos mostrados são o que ela contém agora.",
+    interrupted: "Uma edição anterior desta imagem foi interrompida. A imagem volta a ser como era antes que suas próximas alterações sejam verificadas ou aplicadas.",
   },
   // JobList.tsx
   jobs: {
@@ -189,6 +357,7 @@ const pt: Messages = {
       pack: "Empacotando",
       verify: "Verificando",
       finalize: "Finalizando",
+      install: "Instalando",
     },
     steps: {
       scan: "Leitura",
@@ -201,6 +370,7 @@ const pt: Messages = {
       pack: "Empacotamento",
       verify: "Verificação",
       finalize: "Finalização",
+      install: "Instalação",
     },
     stepsLabel: "Etapas",
     stepDone: (s) => `Concluído: ${s}`,
@@ -211,13 +381,19 @@ const pt: Messages = {
     showFinder: "Mostrar no Finder",
     showExplorer: "Mostrar no Explorer",
     showFolder: "Mostrar na pasta",
-    lz4: {
-      pack: "LZ4: empacotar",
-      unpack: "LZ4: desempacotar",
-      trace: "LZ4: rastrear",
-      unpatch: "LZ4: remover patch",
-      runtime: "Runtime AMPR",
+    packTag: {
+      lz4Pack: (level: string) => `LZ4: empacotar · ${level}`,
+      lz4Unpack: "LZ4: desempacotar",
+      zstdPack: (level: string) => `zstd: empacotar · ${level}`,
+      level: (n: number) => `nível ${num(n)}`,
+      zstdUnpack: "zstd: desempacotar",
+      withRules: (tag) => `${tag} · regras próprias`,
     },
+    /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
+    edit: "Editar",
+    editRebuild: "Editar · recriar",
+    transfer: "Transferência",
+    extract: "Extração",
     job: (id) => `Tarefa ${id}`,
     done: "Concluída",
     cancelled: "Cancelada",
@@ -225,14 +401,21 @@ const pt: Messages = {
     cancelling: "Cancelando…",
     queued: "Na fila",
     dismiss: "Ocultar",
+    retry: "Tentar de novo",
+    retrying: "Iniciando",
     stopJob: "Parar tarefa?",
     cancel: "Cancelar",
-    stopHint: "Clique em “Parar tarefa?” de novo em até 4 segundos para pará-la.",
+    stopHint: "Pressione “Parar tarefa?” de novo em até 4 segundos para pará-la.",
+    remoteLabel: (name, device) => `${name}, uma tarefa em ${device}`,
+    remoteTitle: (device) => `Em execução em ${device} e usando arquivos deste dispositivo: aqui você só pode cancelá-la`,
     from: "de ",
     left: (d) => `tempo restante: ${d}`,
     inStep: (time) => `${time} nesta etapa`,
     result: (bytes, n) => `${bytes}, ${num(n)} ${plural(n, FILES)} →`,
     outputPath: "Caminho da saída",
+    sourceDeleted: (v) => `Origem excluída: ${v}`,
+    sourceKept: (v) => `Origem mantida: ${v}`,
+    sourcePartlyDeleted: (v) => `Origem excluída em parte: ${v}`,
     checks: "Verificações",
     verifiedPlain: (n) =>
       `Verificado: ${num(n)} ${plural(n, { one: "verificação aprovada", many: "verificações aprovadas", other: "verificações aprovadas" })}`,
@@ -241,6 +424,9 @@ const pt: Messages = {
     coverage: (checked, total, n) =>
       `Dados verificados: ${checked} de ${total} em ${num(n)} ${plural(n, { one: "amostra", many: "amostras", other: "amostras" })}`,
     cantBuild: "Não é possível criar este jogo:",
+    cantEdit: "Não é possível aplicar as alterações:",
+    cantExtract: "Não é possível extrair:",
+    cantTransfer: "Não é possível transferir:",
     cantBuildAs: (f) => (
       <>
         Não é possível criar este jogo como <b>{f}</b>:
@@ -264,11 +450,10 @@ const pt: Messages = {
     truncated: "Limite de escaneamento atingido. Esta lista pode estar incompleta.",
     limits: "A busca para em seis níveis de pastas e depois de cerca de 15 segundos de escaneamento.",
     noRoots: "Não há pastas disponíveis para escanear.",
-    none: "Nenhum jogo encontrado. A busca vai até seis níveis de profundidade e ignora pastas do sistema. Outras origens ainda podem ser escolhidas em “Inspecionar” ou “Converter”.",
+    none: "Nenhum jogo encontrado. A busca vai até seis níveis de profundidade e ignora pastas do sistema. Outras origens ainda podem ser escolhidas em “Editar” ou “Converter”.",
     skipped: "Locais e arquivos ignorados",
-    stays: "Os resultados ficam aqui até você clicar em “Atualizar”. Novas saídas aparecem depois de atualizar.",
     library: "Biblioteca",
-    storageTip: "Espaço livre no armazenamento interno do console (/data), no último escaneamento",
+    storageTip: "Espaço livre no armazenamento interno do console (/data)",
     free: (free, total) => (
       <>
         Espaço livre: <b>{free}</b> de {total}
@@ -278,84 +463,137 @@ const pt: Messages = {
     cards: "Exibição em cartões",
     list: "Exibição em lista",
     games: "Jogos",
-    inspect: (n) => `Inspecionar ${n}`,
+    edit: (n) => `Editar ${n}`,
     convert: (n) => `Converter ${n}`,
     remove: (n) => `Excluir ${n}`,
-    lz4Tip: "Empacotado com LZ4: pacotes de assets do ampr_emu",
-    lz4Packed: " empacotado",
+    deleting: (n) => `Excluindo ${n}`,
+    lz4Tip: "Pacotes de assets LZ4",
+    zstdTip: "Pacotes de assets zstd",
+    showAs: "Mostrar como",
+    kinds: "Mostrar tipo",
+    all: "Todos",
+    lz4Chip: "LZ4",
+    zstdChip: "zstd",
+    countIn: (n, path) => (
+      <>
+        <b>{num(n)}</b> {plural(n, { one: "jogo em", many: "jogos em", other: "jogos em" })} {path}
+      </>
+    ),
   },
-  // Lz4.tsx
-  lz4: {
-    title: "Pacotes de assets LZ4",
-    help: "Como o LZ4 funciona",
-    scenario: "Cenário LZ4",
-    scenarios: { trace: "Rastrear", pack: "Empacotar/Desempacotar" },
-    actions: { patch: "Aplicar patch", unpatch: "Remover patch", pack: "Empacotar", unpack: "Desempacotar" },
-    scenarioInfo: (s, packed) => s === "trace"
-      ? "Registra quais assets o jogo lê enquanto você joga, para uso em “Empacotar”."
-      : packed
-        ? "Grava os pacotes LZ4 do jogo de volta como arquivos comuns."
-        : "Empacota os assets do jogo em volumes LZ4 que o ampr_emu lê enquanto o jogo roda.",
-    traceInfo: (a, image) => a === "patch"
-      ? image
-        ? "Recria esta imagem com o runtime de rastreamento e depois a substitui."
-        : "Instala o runtime de rastreamento nesta pasta."
-      : image
-        ? "Recria esta imagem com o runtime de release e depois a substitui."
-        : "Devolve o runtime de release a esta pasta.",
-    noAmpr: "o jogo não usa AMPR",
-    packedFirst: "a origem está empacotada com LZ4: desempacote-a primeiro",
-    damaged: "os pacotes LZ4 dela estão danificados",
-    archive: "não é possível rastrear um arquivo compactado: converta-o primeiro",
-    chooseFirst: "escolha uma origem primeiro",
-    notRead: "a origem ainda não foi lida",
-    pickProfile: "Perfil LZ4",
-    profileFilter: "Perfil LZ4 (TOML)",
-    pickTracesFolder: "Rastreamentos LZ4 (uma pasta com ampr_commands.bin e ampr_emu.index)",
-    pickTracesEither: "Rastreamentos LZ4: o zip ou uma pasta com os dois arquivos",
-    pickTracesZip: "Rastreamentos LZ4 (zip)",
-    unreadable: "Não é possível iniciar: esta origem não pôde ser lida (veja “Origem”).",
-    pending: (a) => a === "patch"
-      ? "Não é possível aplicar o patch com tarefas em execução ou na fila."
-      : "Não é possível remover o patch com tarefas em execução ou na fila.",
-    replacing: "Uma tarefa já está recriando esta imagem: aguarde até ela terminar.",
+  // Storage.tsx, Files.tsx: the Storage tab (Library | File explorer)
+  storage: {
+    views: "Exibição do armazenamento",
+    library: "Biblioteca",
+    files: "Explorador de arquivos",
+    title: "Explorador de arquivos",
+    pickTitle: "Escolha uma pasta para explorar",
+    pickPrompt: "Escolha uma pasta para explorar os arquivos dela",
+    choose: "Escolher pasta",
+    roots: "Unidades",
+    location: "Local",
+    folders: "Pastas",
+    up: "Acima",
+    upTip: "Subir uma pasta",
+    refresh: "Atualizar",
+    filter: "Filtrar por nome",
+    filterLabel: "Filtrar esta pasta por nome",
+    inFolder: (dirs, files) =>
+      `${num(dirs)} ${plural(dirs, { one: "pasta", many: "pastas", other: "pastas" })}, ${num(files)} ${plural(files, FILES)}`,
+    matches: (n) => `${num(n)} ${plural(n, { one: "resultado", many: "resultados", other: "resultados" })}`,
+    firstOf: (max, n) => `exibindo ${num(max)} de ${num(n)}, a partir do início`,
+    truncated: "Esta pasta tem mais de 10.000 itens: só os primeiros 10.000 são listados.",
+    name: "Nome",
+    size: "Tamanho",
+    emptyFolder: "Esta pasta está vazia.",
+    noMatch: (f) => `Nada aqui corresponde a “${f}”.`,
+    noRoots: "Não há unidades disponíveis para explorar.",
+    cantList: "Não é possível abrir esta pasta:",
+    link: "Link",
+    linkTip: "Um link: pode ser aberto, mas não renomeado, movido nem excluído aqui",
+    mounted: "Montado",
+    mountedTip: "Montado pelo ShadowMount+: feche o jogo e desative o ShadowMount+ para excluí-lo, renomeá-lo ou movê-lo",
+    mountedNote: "As imagens marcadas como Montado estão em uso pelo ShadowMount+: feche o jogo e desative o ShadowMount+ para excluí-las, renomeá-las ou movê-las.",
+    open: (n) => `Abrir ${n}`,
+    more: (n) => `Mais ações para ${n}`,
+    rename: (n) => `Renomear ${n}`,
+    renameTip: "Renomear (F2)",
+    move: (n) => `Mover ${n}`,
+    moveTip: "Mover para outra pasta",
+    moveTitle: (n) => `Mover ${n} para`,
+    remove: (n) => `Excluir ${n}`,
+    removeTip: "Excluir (tecla Delete)",
+    removeTipMac: "Excluir (teclas fn+Apagar)",
+    cantDelete: "Não é possível excluir:",
+    cantRename: "Não é possível renomear:",
+    cantMove: "Não é possível mover:",
+    sameFolder: "Já está nessa pasta.",
+    deleted: (path) => `Excluído: ${path}`,
+    renamed: (path) => `Renomeado para ${path}`,
+    moved: (path) => `Movido para ${path}`,
+    devices: "Dispositivos",
+    thisDevice: "Este dispositivo",
+    otherDevice: "“Mover” fica em um só dispositivo: arraste para a aba de outro dispositivo para copiar para lá.",
+    dropCopy: (folder) => `Solte para copiar para ${folder}`,
+    dropMove: (folder) => `Solte para mover para ${folder}`,
+    cantCopy: "Não é possível copiar:",
+    copyNoFolder: "Abra primeiro uma pasta nesse dispositivo.",
+    copyOne: (name, to) => `Copiando ${name} para ${to}. A transferência aparece em “Conectar”.`,
+    copyMany: (n, to) =>
+      plural(n, {
+        one: `Copiando ${num(n)} item para ${to}. A transferência aparece em “Conectar”.`,
+        many: `Copiando ${num(n)} de itens para ${to}. A transferência aparece em “Conectar”.`,
+        other: `Copiando ${num(n)} itens para ${to}. A transferência aparece em “Conectar”.`,
+      }),
+    openConnect: "Abrir “Conectar”",
+  },
+  // Pack.tsx
+  pack: {
+    title: "Empacotar",
+    help: "Como empacotar funciona",
+    engine: "Tipo de pacotes",
+    engines: { zstd: "zstd", lz4: "LZ4" },
+    actions: { pack: "Empacotar", unpack: "Desempacotar" },
+    info: (e, packed) =>
+      e === "zstd"
+        ? packed
+          ? "Grava os pacotes zstd de volta como arquivos comuns."
+          : "Empacota os assets do jogo em volumes zstd."
+        : packed
+          ? "Grava os pacotes LZ4 de volta como arquivos comuns."
+          : "Alguns jogos podem não iniciar. Empacota os assets do jogo em volumes LZ4.",
+    noAmprRuntime: "Este jogo não tem runtime AMPR: o Pack injeta o ampr-emu-ng.",
+    strategy: (s) => `Estratégia de empacotamento: ${s === "everything" ? "empacotar tudo exceto os arquivos do sistema" : "estratégia LZ4 de compatibilidade"}.`,
+    patch: "Um pacote de patch não pode ser empacotado.",
+    additionalContent: "Conteúdo adicional (sem eboot.bin) não pode ser empacotado.",
+    unreadable: "Não é possível iniciar: a origem não pôde ser lida (veja “Origem”).",
     blocked: (a, first, more) =>
-      `Não é possível ${a === "patch" ? "aplicar o patch" : a === "unpatch" ? "remover o patch" : a === "pack" ? "empacotar" : "desempacotar"}: ${first}${more > 0 ? ` (e mais ${num(more)}, veja “Origem”)` : ""}.`,
-    chooseGame: "Escolha primeiro uma pasta de jogo ou uma imagem.",
-    noAmprGame: "Este jogo não usa AMPR, então o LZ4 não pode ser usado aqui.",
-    installsRuntime: (a, version) =>
-      a === "pack"
-        ? `Este jogo não tem ampr_emu: Empacotar instala o ampr_emu ${version} incluído.`
-        : a === "patch"
-          ? `Este jogo não tem ampr_emu: Aplicar patch instala o runtime de rastreamento incluído (ampr_emu ${version}).`
-          : `Este jogo não tem ampr_emu: Remover patch instala o runtime de release incluído (ampr_emu ${version}).`,
-    freshIndex: (state, a) =>
-      `${state === "stale" ? "O ampr_emu.index não lista os arquivos deste jogo" : state === "damaged" ? "Não dá para ler o ampr_emu.index" : "Este jogo não tem ampr_emu.index"}: ${a === "pack" ? "Empacotar" : a === "patch" ? "Aplicar patch" : "Remover patch"} grava um novo.`,
-    unavailable: (items) => `Indisponível para esta origem: ${items.join("; ")}.`,
-    readOnly: (kind) => <>
-      <b>{kind}</b> é somente leitura no console, então não pode ser rastreado. Converta-o primeiro para <b>ffpkg</b> ou <b>exfat</b>.
-    </>,
-    action: "Ação",
-    traceAction: "Ação de rastreamento",
-    changes: (a, image) => a === "patch"
-      ? `Altera ${image ? "esta imagem" : "esta pasta"}: o runtime de rastreamento substitui fakelib/libSceAmpr.sprx, sem backup.`
-      : `Altera ${image ? "esta imagem" : "esta pasta"}: o runtime de release volta e os rastreamentos são excluídos, sem backup.`,
-    replay: (web) => `Jogue e depois escolha esta origem de novo para usar os rastreamentos dela.${web ? " “Rastrear” também os oferece como zip." : ""}`,
-    room: "Espaço para o rastreamento",
-    roomHint: "Espaço livre para o rastreamento do jogo. Monte a imagem com image_rw=, ou nada será gravado.",
-    alreadyRelease: "Já está no runtime de release: só o índice é gravado de novo.",
-    spaceHint: "Precisa de espaço livre do tamanho da imagem; ela só é substituída depois que a cópia é verificada.",
-    deletesTraces: (a, bytes, web) =>
-      `${a === "patch" ? "“Aplicar patch”" : "“Remover patch”"} exclui os rastreamentos desta origem (${bytes}): ${web ? "baixe-os antes." : "copie-os antes."}`,
-    useProfile: "Usar um perfil de regras em vez disso",
-    profile: "Perfil",
-    choose: "Escolher",
-    profileHint: "Um arquivo TOML com regras de empacotamento, usado no lugar dos rastreamentos.",
+      `Não é possível ${a === "pack" ? "empacotar" : "desempacotar"}: ${first}${more > 0 ? ` (e mais ${num(more)}, veja “Origem”)` : ""}.`,
     target: "Destino",
-    packInto: "Empacotar em",
-    direct: "Empacota direto na imagem; os arquivos do jogo são lidos duas vezes.",
-    targetFormat: "Formato de destino",
-    unpackFolder: "Uma nova pasta do jogo com os pacotes gravados de volta como arquivos comuns.",
+    packFolder: (e) => `Recomendado. O mais rápido, menor latência: uma nova pasta do jogo, com os assets em pacotes ${e === "zstd" ? "zstd" : "LZ4"}.`,
+    levels: { fast: "Rápido", medium: "Médio", max: "Máximo" },
+    levelNotes: {
+      zstd: {
+        fast: { tone: "good", text: "Recomendado. zstd 5: rápido, bom tamanho." },
+        medium: { text: "zstd 9: menor, mais lento." },
+        max: { text: "zstd 19: o menor; bem mais lento, mais memória." },
+      },
+      lz4: {
+        fast: { tone: "good", text: "Recomendado. LZ4 padrão: o mais rápido." },
+        medium: { text: "LZ4 HC 9: menor, mais lento." },
+        max: { text: "LZ4 HC 12: o menor, o mais lento." },
+      },
+    },
+    runtime: "Runtime",
+    runtimeNotes: {
+      ng: { tone: "good", text: "Recomendado. Lê pacotes zstd e LZ4." },
+      ampr_emu: { text: "O ampr_emu original." },
+    },
+    ngNote: "Precisa do ampr-emu-ng: Empacotar o instala em fakelib/. Desative a atualização de fakelib do ShadowMount+, senão ela substitui o runtime.",
+    installsRuntime: (version) => `Não há ampr_emu aqui: Empacotar instala o ampr_emu ${version}.`,
+    freshIndex: (state) =>
+      `${state === "stale" ? "O ampr_emu.index está desatualizado" : state === "damaged" ? "O ampr_emu.index está danificado" : "Não há ampr_emu.index"}: Empacotar grava um novo.`,
+    direct: "Empacota direto na imagem; lê o jogo duas vezes.",
+    unpackFolder: "Uma nova pasta do jogo com arquivos comuns.",
     unpackHint: (n) =>
       n === null
         ? "Grava os arquivos empacotados de volta como arquivos comuns."
@@ -368,79 +606,57 @@ const pt: Messages = {
     already: (a, fmt) => <>
       Este jogo já está sendo gravado como <b>{fmt}</b>; clicar em {a === "pack" ? "“Empacotar”" : "“Desempacotar”"} de novo gera uma segunda cópia.
     </>,
-    profileRules: "Empacota o que as regras do perfil indicam; os arquivos que a engine abre diretamente ficam soltos.",
-    chosenRules: "Empacota os arquivos que o jogo leu nestes rastreamentos; os arquivos que a engine abre diretamente ficam soltos.",
-    ownRules: "Empacota os arquivos que o jogo leu na última sessão rastreada; os arquivos que a engine abre diretamente ficam soltos.",
-    guessRules: "Sem rastreamentos: empacota por uma estimativa embutida, menos confiável. Rastreie primeiro ou escolha rastreamentos ou um perfil.",
-    recorded: "Rastreamentos gravados",
-    recordedHint: (bytes) => `ampr_commands.bin (${bytes}): “Empacotar” usa esses rastreamentos.`,
-    downloadHint: "Feche o jogo, espere um minuto e baixe pelo navegador de um computador. Lá, escolha o zip em “Empacotar/Desempacotar” → “Rastreamentos”.",
-    download: (bytes, zip) => `Baixar rastreamentos (${bytes}) como ${zip}`,
-    missingIndex: "Não há ampr_emu.index nesta origem: “Empacotar” precisa dele ao lado de ampr_commands.bin.",
-    truncatedJournal: "Um diário cortado no final ainda pode ser empacotado, até o último registro completo.",
-    fakelibWarning: (recorded) => recorded
-      ? "Poucos rastreamentos ou nenhum? Desative o atualizador da fakelib, aplique o patch de novo e jogue outra vez."
-      : "Desative o atualizador da fakelib durante o rastreamento, ou nada será gravado.",
-    emptyTitle: "Escolha um jogo que use AMPR",
-    experimental: "Experimental: guarde uma cópia do jogo original.",
-    chooseSource: "Escolher origem",
     source: "Origem",
-    traces: "Rastreamentos",
-    optionalTraces: "Rastreamentos (opcional)",
-    unlock: "Desbloquear para escolher outros rastreamentos",
-    loaded: "Os rastreamentos já foram carregados desta origem",
-    lockedHint: (bytes) => `Os rastreamentos desta origem (${bytes}). Clique no cadeado para escolher outros.`,
-    clear: "Limpar",
-    zip: "Zip",
-    folder: "Pasta",
-    tracesHint: "Escolha o zip amprtrace de “Baixar rastreamentos” ou uma pasta com os dois arquivos de rastreamento.",
-    useOwn: "Usar os rastreamentos da origem",
-    patchResult: (a, n) =>
-      a === "patch"
-        ? `Patch aplicado: o runtime de rastreamento está instalado; o índice lista ${num(n)} ${plural(n, FILES)}.`
-        : `Patch removido: o runtime de release voltou; o índice lista ${num(n)} ${plural(n, FILES)}.`,
-    removed: (files) => `Arquivos de rastreamento antigos removidos: ${files.join(", ")}.`,
+    rules: {
+      title: "Regras próprias (TOML)",
+      titleWith: (name) => `Regras próprias (TOML): ${name}`,
+      info: "Um perfil da estratégia de empacotamento no formato do ampr_pack.py do ampr_emu e do Lazy_AMPR decide quais arquivos são empacotados e quais ficam soltos. Vale a última regra que corresponde; os arquivos do sistema sempre ficam soltos.",
+      warn: "Regras erradas podem deixar um jogo que não inicia. Guarde uma cópia.",
+      pickTitle: "Estratégia de empacotamento (arquivo TOML)",
+      clear: "Limpar",
+    },
   },
-  // Lz4Help.tsx
-  lz4Help: {
-    title: "Como o LZ4 funciona",
+  // PackHelp.tsx
+  packHelp: {
+    title: "Como empacotar funciona",
     close: "Fechar",
-    warning: "Experimental, só para jogos AMPR. Guarde uma cópia do jogo original.",
     body: () => (
       <>
-        <h3>1. Empacotar/Desempacotar</h3>
+        <h3>zstd</h3>
         <ol>
-          <li>
-            Escolha o jogo original, <b>Empacotar/Desempacotar</b> e os rastreamentos (ou um perfil).
-          </li>
-          <li>
-            Grave uma pasta empacotada ou uma imagem comum; uma pasta pode ser convertida para qualquer formato em{" "}
-            <b>Converter</b>.
-          </li>
-          <li>
-            Uma origem empacotada mostra <b>Desempacotar</b> no lugar: os arquivos soltos voltam.
-          </li>
-          <li>Empacotar mantém o ampr_emu do jogo se for a versão incluída ou mais nova e ler pacotes LZ4; senão, instala o de release incluído, inclusive no lugar do runtime de rastreamento do LZ4 e em um jogo que não tem um.</li>
+          <li>Empacota os assets do jogo em volumes zstd, numa pasta ou numa imagem.</li>
+          <li><b>Rápido</b> (zstd 5) é ágil; <b>Médio</b> (9) e <b>Máximo</b> (19) são menores e mais lentos.</li>
+          <li>Um jogo empacotado mostra <b>Desempacotar</b>: os arquivos comuns voltam.</li>
         </ol>
 
-        <h3>2. Rastrear</h3>
+        <h3>LZ4</h3>
         <ol>
-          <li>
-            Escolha o <b>ffpkg</b> ou o <b>exfat</b> do jogo e depois <b>Rastrear</b> → <b>Aplicar patch</b>.
-          </li>
-          <li>Desative o atualizador da fakelib: ele sobrescreve o runtime de rastreamento.</li>
-          <li>
-            Monte com <span className="path">image_rw=</span>, jogue uma sessão e feche o jogo.
-          </li>
-          <li>
-            Use <b>Baixar rastreamentos</b> na página do PS5 ou copie ampr_commands.bin e ampr_emu.index.
-          </li>
+          <li><b>Alguns jogos podem não iniciar.</b> Guarde uma cópia.</li>
+          <li>Empacota em volumes LZ4, numa pasta ou numa imagem: <b>Rápido</b> (LZ4), <b>Médio</b> (HC 9), <b>Máximo</b> (HC 12).</li>
+          <li>Runtime: <b>ampr-emu-ng</b> (padrão) ou o <b>ampr_emu</b> original.</li>
+          <li>Um jogo empacotado mostra <b>Desempacotar</b>.</li>
+        </ol>
+
+        <h3>ampr-emu-ng</h3>
+        <ol>
+          <li>Lê pacotes zstd e LZ4; Empacotar o instala em fakelib/.</li>
+          <li>Desative a atualização de fakelib do ShadowMount+, senão ela substitui o runtime e o jogo não consegue ler seus pacotes.</li>
+        </ol>
+
+        <h3>Estratégia de empacotamento</h3>
+        <ol>
+          <li><b>Empacotar tudo exceto os arquivos do sistema</b> (zstd, e LZ4 com ampr-emu-ng): todos os arquivos exceto eboot.bin, executáveis e módulos, sce_sys, sce_module, fakelib e os arquivos .ini (dlc_emu.ini continua editável); o ampr-emu-ng serve o resto, áudio e vídeo incluídos.</li>
+          <li><b>Estratégia LZ4 de compatibilidade</b> (LZ4 com ampr_emu): as configurações, as mídias e os outros arquivos que o jogo lê diretamente ficam soltos.</li>
+          <li>Só ao empacotar: em <b>Regras próprias (TOML)</b>, escolha um perfil no formato do ampr_pack.py e do Lazy_AMPR, neste dispositivo ou em outro.</li>
+          <li>Vale a última regra que corresponde; os arquivos do sistema sempre ficam soltos. Regras erradas podem deixar um jogo que não inicia.</li>
         </ol>
       </>
     ),
   },
   // Picker.tsx
   picker: {
+    devices: "Dispositivos",
+    thisDevice: "Este dispositivo",
     drives: "Unidades",
     location: "Local",
     parent: "Pasta acima",
@@ -451,22 +667,35 @@ const pt: Messages = {
     noFolders: "Nenhuma pasta aqui.",
     noImages: "Nenhuma pasta, imagem de PS5 ou arquivo compactado aqui.",
     noFiles: (ext) => `Nenhuma pasta ou arquivo ${dotted(ext, " ou ")} aqui.`,
+    chooseFiles: (n) => (n === 0 ? "Escolher arquivos" : plural(n, { one: `Escolher ${num(n)} arquivo`, many: `Escolher ${num(n)} arquivos`, other: `Escolher ${num(n)} arquivos` })),
+    nothing: "Nenhuma pasta ou arquivo aqui.",
+    cantList: "Não é possível abrir esta pasta:",
     cancel: "Cancelar",
     chooseFolder: "Escolher esta pasta",
+    netOnlyHere: "Arquivos compactados e fpkg: só deste dispositivo.",
+    shortcuts: "Atalhos",
+    addShortcut: "Adicionar atalho",
+    removeShortcut: "Remover atalho",
+    shortcutsFull: "No máximo 9 atalhos: remova um primeiro.",
+    removeShortcutNamed: (name: string) => `Remover atalho ${name}`,
   },
   // common.tsx
   common: {
     folder: "Pasta",
-    pickFolder: "Pasta do jogo",
-    pickImage: "Imagem ou arquivo compactado do jogo",
-    pickImageFilter: "Imagens e arquivos compactados",
-    pickFolderButton: "Pasta",
-    pickImageButton: "Imagem/Arquivo compactado",
+    pickButton: "Escolher",
+    pickAny: "Pasta, imagem ou arquivo compactado do jogo",
     source: "Origem",
     emptyTitle: "Escolha uma pasta, imagem ou arquivo compactado de jogo",
-    emptyText: "Uma pasta de jogo de PS5 ou uma imagem, pacote ou arquivo compactado dela.",
     accepted: "Origens aceitas",
     unknownTitle: "Título desconhecido",
+    unsigned: (n: number) =>
+      plural(n, {
+        one: `${num(n)} executável não está assinado, então o jogo não vai iniciar. Ao converter o jogo, ele é assinado.`,
+        many: `${num(n)} de executáveis não estão assinados, então o jogo não vai iniciar. Ao converter o jogo, eles são assinados.`,
+        other: `${num(n)} executáveis não estão assinados, então o jogo não vai iniciar. Ao converter o jogo, eles são assinados.`,
+      }),
+    patch: "Patch",
+    additionalContent: "Conteúdo adicional",
     reading: "Lendo a origem",
     unreadable: "Origem ilegível",
     backport: "Backport",
@@ -486,22 +715,15 @@ const pt: Messages = {
     files: (n) => `${num(n)} ${plural(n, FILES)}`,
     contentId: "ID do conteúdo",
     noAmpr: "eboot.bin não importa libSceAmpr",
-    runtime: {
-      forge_release: "de release do Forge",
-      forge_trace: "de rastreamento do Forge",
-      other: "outro",
-      none: "nenhum",
-    },
-    packed: "Empacotado",
+    traceRuntime: "Runtime de rastreamento do LZ4 antigo",
+    noRuntime: "Sem runtime",
+    packed: (kind) => `Empacotado (${kind})`,
+    zstdKept: "pacotes de assets zstd: a conversão os mantém",
     damaged: "Pacotes danificados",
-    traced: "Rastreado",
-    plain: "Não empacotado",
+    unpacked: "Não empacotado",
     packedDetail: (files, volumes, percent) =>
       `${num(files)} ${plural(files, FILES)} em ${num(volumes)} ${plural(volumes, { one: "volume", many: "volumes", other: "volumes" })}` +
       (percent === null ? "" : `, ${num(percent)}% do tamanho`),
-    journal: (size) => `diário de ${size}`,
-    noJournal: "ainda sem diário",
-    runtimeIs: (label) => `runtime ${label}`,
     index: {
       stale: "ampr_emu.index desatualizado: uma conversão o renova",
       damaged: "ampr_emu.index danificado: uma conversão o regrava",
@@ -512,7 +734,7 @@ const pt: Messages = {
         ? `uma conversão instala o ampr_emu ${version} incluído`
         : a === "replace"
           ? `uma conversão troca o runtime pelo ampr_emu ${version} incluído`
-          : `ampr_emu ${version}: uma conversão o mantém`,
+          : `uma conversão o mantém`,
     backportLibs: (exclusive, n) =>
       `${exclusive ? "fakelib2/, montado sozinho" : "fakelib/"}, ${num(n)} ${plural(n, { one: "biblioteca", many: "bibliotecas", other: "bibliotecas" })} de backport`,
     findings: "Avisos da pré-verificação",
@@ -542,12 +764,24 @@ const pt: Messages = {
     text: (folder) =>
       folder
         ? "A pasta e tudo o que há nela serão excluídos para sempre: sem Lixeira, sem desfazer. Se a exclusão parar no meio, parte do conteúdo pode já ter sido apagada."
-        : "O arquivo de imagem será excluído para sempre: sem Lixeira, sem desfazer. Se a exclusão parar no meio, parte dele pode já ter sido apagada.",
+        : "O arquivo de imagem será excluído para sempre: sem Lixeira, sem desfazer.",
     no: "Não",
     yes: "Sim, excluir",
     archiveTitle: "Excluir este arquivo compactado?",
     archiveText:
       "O arquivo compactado será excluído para sempre: sem Lixeira, sem desfazer. As outras partes de um arquivo em várias partes ficam como estão.",
+    fileTitle: "Excluir este arquivo?",
+    fileText: "O arquivo será excluído para sempre: sem Lixeira, sem desfazer.",
+  },
+  // replace.tsx
+  replace: {
+    title: (n) =>
+      plural(n, { one: `${num(n)} item já existe lá`, many: `${num(n)} itens já existem lá`, other: `${num(n)} itens já existem lá` }),
+    inFolder: (folder) => <>Em {folder}:</>,
+    more: (n) => `e mais ${num(n)}`,
+    text: "“Substituir” coloca os novos no lugar deles: os arquivos antigos se perdem de vez, sem Lixeira e sem desfazer. Uma pasta sobre outra pasta com o mesmo nome é mesclada: os arquivos com o mesmo nome são substituídos, e todo o resto que está lá fica.",
+    cancel: "Cancelar",
+    replace: "Substituir",
   },
   // password.tsx
   password: {
@@ -582,6 +816,7 @@ const pt: Messages = {
       quitUnreachable: "Não foi possível acessar o Dump Forge para pará-lo.",
       stillAnswering: "O Dump Forge ainda está respondendo depois de 2 minutos; verifique o PS5.",
       gone: "o Dump Forge não informa mais esta tarefa (ela saiu do histórico de tarefas antes de o resultado ser visto)",
+      uploadIncomplete: "O envio não foi concluído.",
     },
   },
   // target.tsx
@@ -592,26 +827,21 @@ const pt: Messages = {
         text: "Para jogos que dão problema como ffpkg e só rodam como conteúdo de unidade externa. Também abre em um Mac ou PC.",
       },
       ffpkg: {
-        tone: "good",
-        text: "Recomendado. O sistema de arquivos próprio do PS5 (UFS2). Permite montagem com gravação.",
+        text: "O sistema de arquivos próprio do PS5 (UFS2). Permite montagem com gravação.",
       },
       ffpfs: {
-        tone: "warn",
-        text: "Experimental. O sistema de arquivos PFS do PS5, sem compressão. Os nomes de arquivo precisam ser ASCII simples.",
+        text: "O sistema de arquivos PFS do PS5, sem compressão. Os nomes de arquivo precisam ser ASCII simples.",
       },
       ffpfsc: {
-        tone: "warn",
-        text: "Experimental. O menor: um contêiner comprimido em torno de uma imagem, sempre montado como somente leitura.",
+        text: "O menor: um contêiner comprimido em torno de uma imagem, sempre montado como somente leitura.",
       },
-      pkg: {
-        text: "Instala como um jogo da loja e roda na velocidade nativa. Requer kstuff, fpkg-enable e ppr-patch.",
-      },
+      pkg: { tone: "good", text: "Recomendado. Roda como um jogo nativo, mas só se o seu firmware permitir." },
       lz4: {
-        tone: "warn",
-        text: "Experimental. Uma pasta de jogo com os assets empacotados em volumes LZ4, que o emulador AMPR incluído (ampr_emu) desempacota enquanto o jogo roda. Só para jogos que usam AMPR.",
+        text: "Uma pasta de jogo com os assets empacotados em volumes LZ4, que o emulador AMPR incluído (ampr_emu) desempacota enquanto o jogo roda.",
       },
     },
-    innerFfpkg: { tone: "good", text: "Recomendado. O sistema de arquivos próprio do PS5 (UFS2)." },
+    innerFfpkg: { text: "O sistema de arquivos próprio do PS5 (UFS2)." },
+    innerExfat: { tone: "good", text: "Recomendado. A imagem mais estável dentro de um contêiner compactado." },
     level0: { text: "Sem compressão: cada bloco é armazenado como está. O arquivo fica do tamanho da imagem." },
     levelDefault: {
       tone: "good",
@@ -644,13 +874,15 @@ const pt: Messages = {
         },
       },
     },
-    pkgFirmware: "Funciona só no firmware 11.60 ou anterior.",
     imageInside: "Imagem interna",
     imageInsideLabel: "Imagem dentro do ffpfsc",
     compressionLevel: "Nível de compressão",
     compression: "Compressão",
     fullVerify: "Verificação completa",
     fullVerifyHint: "Relê cada byte para verificar a saída. Demora mais.",
+    deleteSource: "Excluir a origem",
+    deleteSourceHint: "Não dá para desfazer. A origem só é excluída depois de uma conversão bem-sucedida.",
+    deleteSourceNas: "Um jogo em um NAS não pode ser excluído daqui.",
     separator: "Um nome não pode conter separador de pastas; use “Alterar” para a pasta.",
     badName: "Um nome não pode ficar em branco, começar com ponto, terminar com ponto ou espaço, nem ter caracteres de controle.",
     tooLong: (bytes, max, folder) =>
@@ -669,7 +901,36 @@ const pt: Messages = {
     savedAs: (name, dir) => `salvo como ${name} em ${dir}`,
     inDir: (dir) => `em ${dir}`,
     generate: "Gerar o nome pelo conteúdo",
-    generatePattern: "[nome do jogo]-[ID do título]",
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "Nomes de saída",
+    parts: { title: "Título", title_id: "ID do título", version: "Versão", pack: "Tipo de pacote", region: "Região", fw: "Firmware" },
+    template: "Modelo do nome",
+    partsLabel: "Inserir uma parte",
+    insert: (part: string) => `Inserir ${part}`,
+    inUse: (part) => `${part} já está no modelo`,
+    example: "Exemplo",
+    length: "Tamanho",
+    bytes: (n, max) => `${n} de ${max} bytes.`,
+    room: (n) => plural(n, { one: `Resta ${num(n)} byte para o título.`, other: `Restam ${num(n)} bytes para o título.` }),
+    noRoom: "Não sobra espaço para o título: ele é omitido.",
+    versionOut: "A versão é omitida para abrir espaço.",
+    cut: "O nome é cortado em 63 bytes.",
+    idOnly: "O texto do modelo ocupa os 63 bytes, então o ID do título nomeia a saída.",
+    limit: "O ShadowMount+ não monta uma imagem cujo nome passe de 63 bytes (58 para ffpfsc), então um nome mais longo tem o título encurtado primeiro.",
+    errors: {
+      long: (max: number) => `Um modelo tem no máximo ${max} bytes.`,
+      open: "Uma { não tem a } de fechamento.",
+      close: "Uma } não tem a { de abertura.",
+      unknown: (token: string) => `{${token}} não é uma parte: use Título, ID do título, Versão, Tipo de pacote, Região ou Firmware.`,
+      twice: (token) => `{${token}} aparece duas vezes no modelo: use cada parte uma só vez.`,
+      char: (c: string) => `Um nome não pode conter ${c}.`,
+      control: "Um nome não pode conter um caractere de controle.",
+      needsName: "Um nome precisa de Título ou ID do título.",
+    },
+    notSaved: "Não salvo: os nomes continuam usando o último modelo válido.",
+    reset: "Redefinir",
   },
   // UpdateToast.tsx
   update: {
@@ -677,7 +938,7 @@ const pt: Messages = {
     update: "Atualizar",
     later: "Mais tarde",
     updating: "Atualizando…",
-    updatingNote: "A nova versão está sendo baixada, o app vai reiniciar sozinho.",
+    updatingNote: "A nova versão está sendo baixada. Esta página vai recarregar sozinha com ela.",
     downloading: "Baixando no navegador: descompacte o arquivo compactado e substitua esta cópia pelo conteúdo dele.",
     failed: (v) => `Não foi possível atualizar para a v${v}`,
     timeout: (v) => `A v${v} não iniciou em um minuto. Se ela foi baixada, pare o Dump Forge e abra-o de novo para concluir a atualização.`,
@@ -685,6 +946,191 @@ const pt: Messages = {
     close: "Fechar",
   },
   // api.ts: prettyDuration's units
+  // Connect.tsx, ConnectHelp.tsx: pairing, Autodiscovery, saved devices
+  connect: {
+    thisDevice: "Este dispositivo",
+    howItWorks: "Como conectar",
+    ipAddress: "Endereço IP",
+    seen: (n: number, unit: "now" | "m" | "h" | "d") =>
+      unit === "m"
+        ? plural(n, { one: `visto há ${num(n)} minuto`, many: `visto há ${num(n)} minutos`, other: `visto há ${num(n)} minutos` })
+        : unit === "h"
+          ? plural(n, { one: `visto há ${num(n)} hora`, many: `visto há ${num(n)} horas`, other: `visto há ${num(n)} horas` })
+          : unit === "d"
+            ? plural(n, { one: `visto há ${num(n)} dia`, many: `visto há ${num(n)} dias`, other: `visto há ${num(n)} dias` })
+            : "visto agora mesmo",
+    listenError: (e) => `Os outros dispositivos não conseguem acessar este: ${e}`,
+    unavailable: (e) => `Conectar não está disponível: ${e}`,
+    loading: "Carregando",
+    discover: "Detecção automática",
+    stop: "Parar",
+    fileTransfer: "Transferência de arquivos",
+    devices: "Dispositivos",
+    show: "Mostrar",
+    all: "Todos",
+    onlineOf: (n, total) => `${num(n)} de ${num(total)} online`,
+    sendFilesTo: (name) => `Enviar arquivos para ${name}`,
+    details: (name) => `Detalhes de ${name}`,
+    userIs: (user) => `usuário ${user}`,
+    nearby: "Por perto",
+    nearbyNone: "Nenhum dispositivo novo encontrado",
+    addDevice: "Adicionar um dispositivo",
+    addressExample: "192.168.1.20 ou nas.local",
+    addByProtocol: "Ou adicione por protocolo:",
+    savedEmpty: "Nenhum dispositivo salvo ainda",
+    savedEmptyHint:
+      "A detecção automática encontra o Forge e armazenamento em rede nesta rede. Pareie um dispositivo e permita lá, ou salve um NAS.",
+    online: "Online",
+    offline: "Offline",
+    computer: "Computador",
+    address: "Endereço",
+    keyId: "ID da chave",
+    lastSeen: "Visto por último",
+    status: "Status",
+    never: "Nunca",
+    unknown: "Desconhecido",
+    forget: "Esquecer",
+    forgetNote: "“Esquecer” remove o pareamento apenas neste dispositivo. Para usá-lo de novo, pareie-o novamente.",
+    close: "Fechar",
+    cancel: "Cancelar",
+    pairTitle: "Parear um dispositivo",
+    pair: "Parear",
+    connectTo: "Conectar",
+    probing: (address) => `Verificando ${address}`,
+    pairing: "Pareando",
+    waitingFor: (address) => `Aguardando ${address} permitir o pareamento`,
+    checkNumber: "Número de verificação",
+    checkHint: "Ele precisa ser igual ao número que o outro dispositivo mostra.",
+    denied: "O outro dispositivo recusou o pareamento.",
+    timedOut: "Ninguém permitiu o pareamento no outro dispositivo a tempo.",
+    pairBusy: "O outro dispositivo tem outros pedidos de pareamento aguardando. Tente de novo em um minuto.",
+    alreadyPaired: "Aquele dispositivo já tem este salvo. Esqueça-o lá primeiro e depois pareie de novo.",
+    tooManyAttempts: "Pedidos recusados demais. Tente de novo em 10 minutos.",
+    pairPromptTitle: (name) => `Parear com ${name}?`,
+    pairPromptBody: (name, platform, ip) =>
+      `${name} (${platform}, ${ip}) quer parear com este dispositivo. Um dispositivo pareado pode ler os arquivos deste dispositivo e adicionar novos.`,
+    pairPromptCheck: (name) => `Só permita se ${name} mostrar o mesmo número de verificação.`,
+    allow: "Permitir",
+    deny: "Recusar",
+    notPaired: "O outro dispositivo não reconhece mais este. Pareie-o novamente.",
+    searching: "Procurando nesta rede",
+    forge: "Forge",
+    save: "Salvar",
+    kindNas: "NAS",
+    nasAddTitle: (protocol) => `Adicionar um NAS ${protocol}`,
+    nasEditTitle: (protocol) => `Editar NAS ${protocol}`,
+    nasName: "Nome",
+    nasAddressHint: "Endereço IP ou nome do host; adicione :porta quando não for 445",
+    nasUser: "Nome de usuário",
+    nasUserHint: "Deixe vazio para entrar como convidado",
+    ftpAddressHint: "Endereço IP ou nome do host; adicione :porta quando não for 21",
+    nfsAddressHint: "Endereço IP ou nome do host; adicione :porta quando não for 2049",
+    ftpUserHint: "Deixe vazio para entrar anonimamente",
+    ftpNote: "O FTP não é criptografado, nem o login.",
+    nfsNote: "O NFS não tem login: o Forge se conecta como root (NFSv4.1, senão NFSv3), então a exportação do servidor precisa permitir este dispositivo. O NFS não é criptografado.",
+    nasPassword: "Senha",
+    nasPasswordKeep: "Deixe vazio para manter a senha salva",
+    guest: "Convidado",
+    passwordSaved: "Salva",
+    passwordNone: "Nenhuma",
+    edit: "Editar",
+    nasForgetNote: "“Esquecer” remove este NAS e a senha salva dele deste dispositivo.",
+    pickSendFiles: "Arquivos a enviar",
+    pickSendFolder: "Pasta a enviar",
+    pickSaveTo: "Onde salvar",
+    thisBrowser: "Este navegador",
+    browserHint: "Arquivos deste celular ou computador vão para uma pasta neste dispositivo, e um arquivo deste dispositivo é salvo por este navegador.",
+    uploadTo: "Pasta de destino do envio",
+    uploadPick: "Escolher arquivos para enviar",
+    uploading: (name, i, n) => `Enviando ${name} (${num(i)} de ${num(n)})`,
+    uploaded: "Envio concluído",
+    uploadSkipped: (names) => `Não enviado, já há lá uma pasta ou um link com esse nome: ${names}.`,
+    uploadedBefore: (done, n) =>
+      plural(done, {
+        one: `${num(done)} de ${num(n)} arquivos foi enviado e fica neste dispositivo.`,
+        other: `${num(done)} de ${num(n)} arquivos foram enviados e ficam neste dispositivo.`,
+      }),
+    cantStart: "Não é possível iniciar a transferência:",
+    cantUpload: "Não é possível enviar:",
+    pickDownload: "Arquivo a baixar",
+    transferIntro: "Envie arquivos ou uma pasta de qualquer dispositivo para uma pasta aqui, em um dispositivo pareado ou em um NAS. A transferência roda como uma tarefa na lista de tarefas.",
+    send: "Enviar",
+    sendWhat: "O que enviar",
+    sendTo: "Enviar para",
+    sendNeedsDevice: "Conecte outro dispositivo primeiro: pareie um Forge ou adicione um NAS.",
+    nothingChosen: "Nada escolhido ainda",
+    chooseFiles: "Escolher arquivos",
+    chooseFolder: "Escolher uma pasta",
+    startTransfer: "Iniciar",
+    uploadHere: "Enviar para este dispositivo",
+    downloadHere: "Baixar deste dispositivo",
+    consoleNoFiles: "O navegador do PS5 não consegue escolher arquivos: abra esta página em um celular ou computador.",
+    wholeRoot: "Não é possível enviar um dispositivo, compartilhamento ou unidade inteiros: escolha uma pasta dentro dele.",
+    helpPhone: "Escaneie o código QR para abrir esta página em um celular. Lá, “Enviar para este dispositivo” e “Baixar deste dispositivo” em “Transferência de arquivos” movem os arquivos do celular.",
+    /** How to connect: short paragraphs, in order (no headings). */
+    help: [
+      "O Conectar liga o Dump Forge no seu PS5 e nos seus computadores da mesma rede.",
+      "Para parear, inicie a “Detecção automática” e escolha “Parear” em “Por perto”, ou digite um endereço em “Adicionar um dispositivo”, e permita no outro dispositivo. Permita só se as duas telas mostrarem o mesmo número de verificação.",
+      "Um NAS (SMB, FTP, NFS) é adicionado do mesmo jeito. Dispositivos pareados e NAS são origem de jogos e destino; os jogos deles não são editados lá.",
+      "“Transferência de arquivos” copia arquivos e pastas entre qualquer um deles. Um nome que já existe lá só é substituído depois que você confirmar.",
+    ],
+    helpSecurity: "Nada do que é enviado entre os dispositivos é criptografado: qualquer pessoa na sua rede pode ler. A senha salva de um NAS fica neste dispositivo sem criptografia. Use o Conectar só na sua rede de casa.",
+    helpSpeed: "“Teste de velocidade”, na linha de um dispositivo pareado ou nos detalhes dele, envia 128 MiB para ele e busca 128 MiB de volta, sem gravar nada no disco, e mostra a velocidade da rede em cada sentido.",
+    speedTest: "Teste de velocidade",
+    speedTestWith: (name) => `Teste de velocidade com ${name}`,
+    speedTesting: "Testando",
+    speedResult: (up, down) => `Envio ${up} MB/s · Recebimento ${down} MB/s`,
+    speedFailed: "O teste de velocidade falhou:",
+    speedNote: "Envia 128 MiB e busca 128 MiB de volta; nada é gravado no disco.",
+    installTitle: "Dump Forge no PS5",
+    ps5Address: "Endereço do PS5",
+    install: "Instalar no PS5",
+    installHint: "Requer o carregador ELF do console acessível na rede (porta 9021).",
+    findingRelease: "Procurando a versão no GitHub",
+    installing: (v, host) => `Instalando o Dump Forge ${v} em ${host}`,
+    installed: (v, host) => `O Dump Forge ${v} está iniciando em ${host}. Pareie-o em Adicionar um dispositivo quando estiver rodando.`,
+    noRelease: "Não foi possível encontrar a versão do Dump Forge para PS5 no GitHub. Verifique a conexão com a internet deste computador e tente novamente.",
+    otherPayload: "Qualquer outro payload ELF:",
+    sendPayload: "Enviar um payload",
+    pickPayload: "Escolha um payload ELF",
+    sendingPayload: (name, host) => `Enviando ${name} para ${host}`,
+    sentPayload: (name, size, host) => `${name} (${size}) enviado para ${host}.`,
+    helpInstallTitle: "Instale o Dump Forge em um PS5 com um clique",
+    helpInstallText: "Use o cartão de instalação do Dump Forge para enviar o payload ao console. Ele baixa do GitHub a versão correspondente (ou a mais recente) e a inicia.",
+  },
+  // Packages.tsx (Storage's Package installer), InstallDialog.tsx, Files.tsx and Connect.tsx's Install pkg
+  install: {
+    view: "Instalador de pacotes",
+    packages: "Pacotes",
+    refresh: "Atualizar",
+    scanning: "Procurando pacotes",
+    none: "Nenhum pacote encontrado neste console.",
+    noneHint: "Copie um arquivo .pkg para o armazenamento do console ou para um pendrive e pressione Atualizar.",
+    truncated: "A lista pode estar incompleta",
+    limits: "A busca parou em um dos seus limites: alguns pacotes podem estar faltando.",
+    cantScan: "Não é possível buscar:",
+    cantInstall: "Não é possível instalar:",
+    content: { game: "Jogo", patch: "Patch", additional_content: "Conteúdo adicional", unknown: "Desconhecido" },
+    install: "Instalar",
+    installName: (name) => `Instalar ${name}`,
+    started: (name) => `Instalando ${name}. A tarefa aparece abaixo.`,
+    tag: "Instalação",
+    title: "Instalar este pacote?",
+    titleOn: (device) => `Instalar este pacote em ${device}?`,
+    file: "Arquivo",
+    game: "Jogo",
+    titleId: "ID do título",
+    version: "Versão",
+    size: "Tamanho",
+    text: "O PS5 busca o pacote no Dump Forge e o instala. Mantenha o Dump Forge aberto até a tarefa terminar.",
+    reinstall: "Se este jogo já estiver instalado, o PS5 exclui a cópia instalada antes de instalar esta.",
+    cancel: "Cancelar",
+    confirm: "Instalar",
+    installPkg: "Instalar pkg",
+    installPkgOn: (device) => `Instalar um pacote em ${device}`,
+    pickTitle: "Escolha um pacote para instalar",
+    sent: (device) => `${device} está instalando o pacote. A tarefa aparece abaixo.`,
+  },
   duration: { s: (s) => `${s} s`, ms: (m, s) => `${m} min ${s} s`, hm: (h, m) => `${h} h ${m} min` },
 };
 

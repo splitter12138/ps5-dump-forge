@@ -10,7 +10,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use ps5_dump_forge_core::{
-    ArchivePassword, ConvertRequest, Event, Format, Jobs, KrakenLevel, Lz4Mode, VerifyMode,
+    ArchivePassword, ConvertRequest, Event, Format, Jobs, KrakenLevel, Lz4Mode, Lz4Runtime,
+    VerifyMode,
 };
 
 const USAGE: &str = "\
@@ -18,15 +19,14 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
        ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc|pkg|lz4
                          [--password-stdin]
                          [--inner exfat|ffpkg|ffpfs] [-o <output>] [--threads N]
-                         [--remove-backport] [--full-verify]
+                         [--remove-backport] [--full-verify] [--delete-source]
                          [--kraken fast|balanced|smallest|stored]
-                         [--level 0..9] [--lz4-profile <toml> | --lz4-traces <zip|dir|journal>]
-                         [--lz4-trace [--lz4-trace-space <MiB>] | --lz4-unpack | --lz4-unpatch
-                          | --lz4-pack]
-       ps5-dump-forge convert <image.exfat|image.ffpkg> --lz4-in-place
-                         (--lz4-trace [--lz4-trace-space <MiB>] | --lz4-unpatch) [--full-verify]
-       ps5-dump-forge lz4-patch <folder>
-       ps5-dump-forge lz4-unpatch <folder>
+                         [--level 0..9] [--lz4-unpack | --lz4-pack]
+                         [--lz4-level 0|3..12] [--lz4-runtime ng|ampr_emu]
+       ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc --zstd-pack
+                         [--zstd-level 1..22]
+                         (with --to lz4, --lz4-pack or --zstd-pack: [--pack-profile <toml>])
+       ps5-dump-forge convert <zstd_packed> --to <format> --zstd-unpack
        ps5-dump-forge serve [--port N] --root <dir> [--root <dir>]...
 
   inspect   describe a game folder, image (.exfat, .ffpkg, .ffpfs, .ffpfsc, .pkg) or archive
@@ -39,7 +39,8 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
   --to      folder, exfat, ffpkg (what ShadowMountPlus recommends), ffpfs (PFS image),
             ffpfsc (compressed PFS container, mounted read-only), or pkg = debug FPKG
             (shown as .fpkg in the app; the file still ends in .pkg), or lz4 = an LZ4 packed
-            folder (AMPR asset packs; titles that import libSceAmpr; named like a folder)
+            folder (AMPR asset packs; a title that doesn't import libSceAmpr takes only
+            --lz4-runtime ng; named like a folder)
   --inner   with --to ffpfsc: the image inside (default ffpkg)
   -o        output path (default: named from the title id, next to the source); an
             output's name without its extension must stay within 63 bytes (58 for
@@ -52,6 +53,10 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
             re-read every byte of the output to verify it (takes longer); by default
             verification is fast: every structural check, small files whole and a random
             sample of the rest
+  --delete-source
+            once the output is verified and in place, delete the source (every part of a
+            multi-part archive) as the app's Delete does; if it can't, the source stays and
+            the job still succeeds (a source kept: <reason> check line)
   --level   with --to ffpfsc: zlib level, 0 (store) to 9 (smallest), default 6
   --kraken  with --to pkg: compression level (default fast). balanced and smallest make a
             package ~2.6% smaller but take ~6x and ~9x longer, every core busy throughout;
@@ -61,48 +66,39 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
             pack the assets into LZ4 packs inside the target: --to folder (the same as
             --to lz4), exfat, ffpkg, ffpfs or ffpfsc (not pkg). Into an image the packs go
             straight in, with no temporary folder; the packed files are read twice
-  --lz4-profile
-            with --to lz4 or --lz4-pack: a TOML pack-rules file (default: this dump's traces, else a
-            built-in guess, which is less reliable)
-  --lz4-traces
-            with --to lz4 or --lz4-pack: traces from the console: the *-amprtrace.zip from Download traces, a
-            folder holding ampr_commands.bin and ampr_emu.index, or that ampr_commands.bin
-            with its ampr_emu.index beside it; picks the files to pack instead of this dump's
-            own traces. Exclusive with --lz4-profile
-  --lz4-trace
-            record LZ4 traces: install the trace runtime, so a play session writes a
-            journal; convert the dump again with --to lz4 to pack what it read. Goes with
-            --to folder, exfat or ffpkg only; exclusive with --lz4-unpack
-  --lz4-trace-space
-            with --lz4-trace: MiB of room kept in an image for the journal, 64 to 1024
-            in steps of 64 (default 256)
+  --zstd-pack
+            pack the assets into zstd packs (ampr_zstd.index + ampr_zstd-NNN.pak, zstd in 256 KiB
+            chunks) and install the zstd runtime at fakelib/libSceAmpr.sprx: --to folder,
+            exfat, ffpkg, ffpfs or ffpfsc (not pkg; into an image straight in, the packed
+            files read twice), any title (ampr-emu-ng injected); no LZ4 option. The runtime is
+            ampr-emu-ng: turn off ShadowMount+'s fakelib update, or it replaces the runtime
+  --zstd-level
+            with --zstd-pack: zstd level, 1 (fastest) to 22 (smallest), default 5
+  --zstd-unpack
+            decode a zstd-packed game's packs into plain files, for any target but lz4;
+            the release runtime replaces the zstd one and ampr_emu.index is written anew
+  --lz4-level
+            with --to lz4 or --lz4-pack: 0 fast (default), 3..12 LZ4 HC (9 medium, 12 max)
+  --lz4-runtime
+            with --to lz4 or --lz4-pack: the runtime installed, ng (ampr-emu-ng, default;
+            reads LZ4 and zstd packs; packs everything except system files) or ampr_emu
+            (the bundled upstream release build; the compatibility LZ4 strategy keeps root
+            files, configs, containers and media loose)
+  --pack-profile
+            with --to lz4, --lz4-pack or --zstd-pack: a TOML pack profile (ampr_pack.py's
+            format, as Lazy_AMPR's): its [[rule]]s pick the packed files instead of the
+            built-in packing strategy (the last matching rule wins; keys Forge doesn't use are logged)
   --lz4-unpack
             unpack LZ4 packs to plain files first, for any target but lz4 (which always
             unpacks first)
-  --lz4-unpatch
-            undo --lz4-trace: install the release runtime (whatever runtime is there), leave
-            out the journal and logs, write a fresh ampr_emu.index. Not for a packed source
-            (unpack it first) or --to lz4 (which always installs the release runtime)
-  --lz4-in-place
-            with --lz4-trace or --lz4-unpatch: REPLACE the source .exfat/.ffpkg image with a
-            patched copy of the same format (no --to, no -o). The copy is written beside it
-            (needs about the image's size of free space) and verified; only then is it
-            renamed over the source, if the source is unchanged. On any failure the source
-            stays as it was
-  lz4-patch change a game folder IN PLACE to record LZ4 traces: install the trace runtime
-            at fakelib/libSceAmpr.sprx (replacing any runtime there), delete the last
-            session's journal and logs, and write a fresh ampr_emu.index. Folders only; not a
-            packed one; titles that import libSceAmpr. Play, then copy ampr_commands.bin and
-            ampr_emu.index to your computer and pack the original dump with --lz4-traces
-  lz4-unpatch
-            undo lz4-patch IN PLACE: install the release runtime at
-            fakelib/libSceAmpr.sprx (replacing any runtime there; no backup exists), delete the
-            journal and logs, and write a fresh ampr_emu.index. Folders only; not a packed one
   serve     the web UI on http://<this computer>:<port> (default 8095); the file browser
-            starts at the --root folders (on the PS5: /data, /mnt/shadowmnt, /mnt/usb0..7,
-            /mnt/ext0..1, no --root). No protections: anyone on the network can use it
+            starts at the --root folders (on the PS5: /data and /mnt/usb0..7, /mnt/ext0..1
+            while mounted, no --root; nothing else is listed). No protections: anyone on the
+            network can use it
   -h, --help";
 
+// One value per run: Convert's size (over clippy's limit on Windows, whose PathBuf is larger) costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum Cli {
     Inspect {
@@ -113,10 +109,6 @@ enum Cli {
     Convert {
         request: ConvertRequest,
         password_stdin: bool,
-    },
-    Lz4Patch {
-        path: PathBuf,
-        unpatch: bool,
     },
     Serve {
         port: u16,
@@ -136,34 +128,17 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     if command == "serve" {
         return parse_serve(args);
     }
-    if command == "lz4-patch" || command == "lz4-unpatch" {
-        let mut paths = Vec::new();
-        for arg in args {
-            match arg.to_str().unwrap_or("") {
-                "-h" | "--help" => return Ok(Cli::Help),
-                flag if flag.starts_with('-') && flag != "-" => {
-                    return Err(format!("unknown option {flag:?}"));
-                }
-                _ => paths.push(PathBuf::from(arg)),
-            }
-        }
-        let [path] = <[PathBuf; 1]>::try_from(paths)
-            .map_err(|p| format!("expected one folder, got {}", p.len()))?;
-        return Ok(Cli::Lz4Patch {
-            path,
-            unpatch: command == "lz4-unpatch",
-        });
-    }
     let mut positional = Vec::new();
     let (mut json, mut to, mut output) = (false, None, None);
     let (mut threads, mut inner, mut remove_backport) = (None, None, false);
     let mut full_verify = false;
+    let mut delete_source = false;
     let mut kraken_level = None;
     let mut ffpfsc_level = None;
-    let (mut lz4_profile, mut lz4_trace, mut lz4_unpack, mut lz4_space) =
-        (None, false, false, None);
-    let mut lz4_traces = None;
-    let (mut lz4_unpatch, mut lz4_in_place, mut lz4_pack) = (false, false, false);
+    let (mut lz4_unpack, mut lz4_pack) = (false, false);
+    let (mut lz4_level, mut lz4_runtime) = (None, None);
+    let (mut zstd_pack, mut zstd_level, mut zstd_unpack) = (false, None, false);
+    let mut pack_profile = None;
     let mut password_stdin = false;
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
@@ -174,6 +149,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             "--password-stdin" => password_stdin = true,
             "--remove-backport" => remove_backport = true,
             "--full-verify" => full_verify = true,
+            "--delete-source" => delete_source = true,
             "--to" => to = Some(parse_format(&text(value("--to")?)?)?),
             "--inner" => inner = Some(parse_format(&text(value("--inner")?)?)?),
             "--level" => {
@@ -194,22 +170,36 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                     _ => return Err("--kraken takes fast, balanced, smallest or stored".into()),
                 })
             }
-            "--lz4-profile" => lz4_profile = Some(PathBuf::from(value("--lz4-profile")?)),
-            "--lz4-traces" => lz4_traces = Some(PathBuf::from(value("--lz4-traces")?)),
-            "--lz4-trace" => lz4_trace = true,
             "--lz4-unpack" => lz4_unpack = true,
             "--lz4-pack" => lz4_pack = true,
-            "--lz4-unpatch" => lz4_unpatch = true,
-            "--lz4-in-place" => lz4_in_place = true,
-            "--lz4-trace-space" => {
-                lz4_space = Some(
-                    text(value("--lz4-trace-space")?)?
-                        .parse::<u32>()
+            "--lz4-level" => {
+                lz4_level = Some(
+                    text(value("--lz4-level")?)?
+                        .parse::<u8>()
                         .ok()
-                        .filter(|g| (64..=1024).contains(g) && g % 64 == 0)
-                        .ok_or("--lz4-trace-space takes 64 through 1024 (MiB), in steps of 64")?,
+                        .filter(|l| *l == 0 || (3..=12).contains(l))
+                        .ok_or("--lz4-level takes 0 or 3 through 12")?,
                 )
             }
+            "--lz4-runtime" => {
+                lz4_runtime = Some(match text(value("--lz4-runtime")?)?.as_str() {
+                    "ng" => Lz4Runtime::Ng,
+                    "ampr_emu" => Lz4Runtime::AmprEmu,
+                    _ => return Err("--lz4-runtime takes ng or ampr_emu".into()),
+                })
+            }
+            "--zstd-pack" => zstd_pack = true,
+            "--zstd-unpack" => zstd_unpack = true,
+            "--zstd-level" => {
+                zstd_level = Some(
+                    text(value("--zstd-level")?)?
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|l| (1..=22).contains(l))
+                        .ok_or("--zstd-level takes 1 through 22")?,
+                )
+            }
+            "--pack-profile" => pack_profile = Some(PathBuf::from(value("--pack-profile")?)),
             "-o" | "--output" => output = Some(PathBuf::from(value("-o")?)),
             "--threads" => {
                 threads = Some(
@@ -233,31 +223,6 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             password_stdin,
         }),
         "convert" => {
-            if lz4_in_place {
-                if to.is_some() || output.is_some() {
-                    return Err(
-                        "--lz4-in-place keeps the image's format and name: no --to, no -o".into(),
-                    );
-                }
-                if !(lz4_trace || lz4_unpatch) {
-                    return Err("--lz4-in-place goes with --lz4-trace or --lz4-unpatch".into());
-                }
-                // Core refuses anything else, read-only images included, with the reason.
-                to = Some(match path.extension().and_then(|e| e.to_str()) {
-                    Some(e)
-                        if e.eq_ignore_ascii_case("ffpkg") || e.eq_ignore_ascii_case("ufs2") =>
-                    {
-                        Format::Ffpkg
-                    }
-                    Some(e) if e.eq_ignore_ascii_case("exfat") => Format::Exfat,
-                    _ => {
-                        return Err("--lz4-in-place replaces an .exfat or .ffpkg image (a game \
-                             folder: lz4-patch or lz4-unpatch)"
-                            .into());
-                    }
-                });
-                output = Some(path.clone());
-            }
             let format = to.ok_or("convert needs --to")?;
             match inner {
                 Some(_) if format != Format::Ffpfsc => {
@@ -272,16 +237,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             if ffpfsc_level.is_some() && format != Format::Ffpfsc {
                 return Err("--level only goes with --to ffpfsc".into());
             }
-            if [lz4_trace, lz4_unpack, lz4_unpatch, lz4_pack]
-                .iter()
-                .filter(|&&f| f)
-                .count()
-                > 1
-            {
-                return Err(
-                    "--lz4-trace, --lz4-unpack, --lz4-unpatch and --lz4-pack exclude each other"
-                        .into(),
-                );
+            if lz4_unpack && lz4_pack {
+                return Err("--lz4-unpack and --lz4-pack exclude each other".into());
             }
             if lz4_pack && format == Format::Lz4 {
                 return Err("--lz4-pack is redundant: --to lz4 packs".into());
@@ -294,32 +251,39 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                 );
             }
             let packing = lz4_pack || format == Format::Lz4;
-            if lz4_unpatch && format == Format::Lz4 {
-                return Err(
-                    "--lz4-unpatch is redundant: the LZ4 target always installs the release \
-                     runtime"
-                        .into(),
-                );
-            }
             if lz4_unpack && format == Format::Lz4 {
                 return Err(
                     "--lz4-unpack is redundant: the LZ4 target always unpacks first".into(),
                 );
             }
-            if lz4_profile.is_some() && !packing {
-                return Err("--lz4-profile only goes with --to lz4 or --lz4-pack".into());
+            if lz4_level.is_some() && !packing {
+                return Err("--lz4-level only goes with --to lz4 or --lz4-pack".into());
             }
-            if lz4_traces.is_some() && !packing {
-                return Err("--lz4-traces only goes with --to lz4 or --lz4-pack".into());
+            if lz4_runtime.is_some() && !packing {
+                return Err("--lz4-runtime only goes with --to lz4 or --lz4-pack".into());
             }
-            if lz4_traces.is_some() && lz4_profile.is_some() {
-                return Err("choose --lz4-profile or --lz4-traces, not both".into());
+            if pack_profile.is_some() && !(packing || zstd_pack) {
+                return Err(
+                    "--pack-profile only goes with --to lz4, --lz4-pack or --zstd-pack".into(),
+                );
             }
-            if lz4_trace && !matches!(format, Format::Folder | Format::Exfat | Format::Ffpkg) {
-                return Err("--lz4-trace only goes with --to folder, exfat or ffpkg".into());
+            if zstd_level.is_some() && !zstd_pack {
+                return Err("--zstd-level only goes with --zstd-pack".into());
             }
-            if lz4_space.is_some() && !lz4_trace {
-                return Err("--lz4-trace-space only goes with --lz4-trace".into());
+            if zstd_pack && matches!(format, Format::Lz4 | Format::Pkg) {
+                return Err(
+                    "--zstd-pack goes with --to folder, exfat, ffpkg, ffpfs or ffpfsc".into(),
+                );
+            }
+            let any_lz4 = lz4_unpack || lz4_pack || lz4_level.is_some() || lz4_runtime.is_some();
+            if zstd_pack && any_lz4 {
+                return Err("--zstd-pack takes no LZ4 option".into());
+            }
+            if zstd_unpack && zstd_pack {
+                return Err("--zstd-unpack and --zstd-pack exclude each other".into());
+            }
+            if zstd_unpack && (any_lz4 || format == Format::Lz4) {
+                return Err("--zstd-unpack takes no LZ4 option and not --to lz4".into());
             }
             // No -o: named in `main` once the archive password is known (an encrypted archive's
             // title is inside it).
@@ -335,22 +299,26 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                     full_verify,
                     kraken_level: kraken_level.unwrap_or_default(),
                     ffpfsc_level: ffpfsc_level.unwrap_or(ps5_dump_forge_core::DEFAULT_FFPFSC_LEVEL),
-                    lz4: if lz4_trace {
-                        Some(Lz4Mode::Trace)
-                    } else if lz4_unpack {
+                    lz4: if lz4_unpack {
                         Some(Lz4Mode::Unpack)
-                    } else if lz4_unpatch {
-                        Some(Lz4Mode::Unpatch)
                     } else if lz4_pack {
                         Some(Lz4Mode::Pack)
                     } else {
                         None
                     },
-                    lz4_profile,
-                    lz4_traces,
-                    lz4_trace_space_mib: lz4_space
-                        .unwrap_or(ps5_dump_forge_core::DEFAULT_LZ4_TRACE_SPACE_MIB),
-                    lz4_in_place,
+                    lz4_level: lz4_level.unwrap_or(0),
+                    lz4_runtime: lz4_runtime.unwrap_or_default(),
+                    zstd_pack,
+                    zstd_level: zstd_level.unwrap_or(ps5_dump_forge_core::DEFAULT_ZSTD_LEVEL),
+                    zstd_unpack,
+                    edits: Vec::new(),
+                    extract: Vec::new(),
+                    transfer: Vec::new(),
+                    replace: false,
+                    edit_rebuild: false,
+                    install: None,
+                    delete_source,
+                    pack_profile,
                     archive_password: None,
                 },
                 password_stdin,
@@ -428,14 +396,21 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// Set once the job is cancelled or done and its `.part` cleaned up; Windows' close
 /// handler waits for it.
 static CLEANED_UP: AtomicBool = AtomicBool::new(false);
+/// Set by the first Ctrl-C itself (`INTERRUPTED` is also set by a dead stdout); a second
+/// one quits at once, since a job stuck in a blocking call may never finish cancelling.
+static SIGNALLED: AtomicBool = AtomicBool::new(false);
 
 // ponytail: a plain signal handler that only sets a flag; the main loop polls it.
 #[cfg(unix)]
 fn on_ctrl_c() {
     extern "C" fn handler(_: libc::c_int) {
+        if SIGNALLED.swap(true, Ordering::Relaxed) {
+            // SAFETY: `_exit` is async-signal-safe; the job's `.part` stays (`stale_parts`).
+            unsafe { libc::_exit(130) };
+        }
         INTERRUPTED.store(true, Ordering::Relaxed);
     }
-    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    // SAFETY: the handler only touches atomics and `_exit`, both async-signal-safe.
     unsafe {
         libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
@@ -455,6 +430,10 @@ fn on_ctrl_c() {
     }
     extern "system" fn handler(event: u32) -> i32 {
         const CTRL_BREAK_EVENT: u32 = 1;
+        if event <= CTRL_BREAK_EVENT && SIGNALLED.swap(true, Ordering::Relaxed) {
+            // A second Ctrl-C: not handled, so the default handler ends the process.
+            return 0;
+        }
         INTERRUPTED.store(true, Ordering::Relaxed);
         if event > CTRL_BREAK_EVENT {
             let start = std::time::Instant::now();
@@ -513,7 +492,6 @@ fn main() -> ExitCode {
             }
             Err(e) => usage_error(&e),
         },
-        Cli::Lz4Patch { path, unpatch } => lz4_patch(&path, unpatch),
         Cli::Serve { port, roots } => serve(port, roots),
     }
 }
@@ -554,6 +532,10 @@ fn serve(port: u16, roots: Vec<PathBuf>) -> ExitCode {
         (roots, Platform::Host)
     };
     let mut opts = Options::new(port, roots, platform, notify);
+    opts.connect_dir = ps5_dump_forge_server::connect::default_dir();
+    if platform == Platform::Ps5 {
+        opts.settings_dir = Some(PathBuf::from(ps5_dump_forge_server::FORGE_DIR));
+    }
     on_ctrl_c();
     opts.interrupt = Some(&INTERRUPTED);
     match ps5_dump_forge_server::serve(opts) {
@@ -641,8 +623,16 @@ fn inspect(path: &Path, password: Option<&ArchivePassword>, json: bool) -> ExitC
     if let Some(v) = &found.forge_version {
         text += &format!("forge:      v{v}\n");
     }
-    if let Some(line) = found.lz4.as_ref().map(lz4_line) {
+    if let Some(line) = found.lz4.as_ref().map(|f| lz4_line(f, found.zstd_packed)) {
         text += &format!("{line}\n");
+    }
+    if !found.unsigned.is_empty() {
+        let n = found.unsigned.len();
+        let more = if n > 5 { ", ..." } else { "" };
+        text += &format!(
+            "unsigned:   {n} executables (a conversion signs them): {}{more}\n",
+            found.unsigned[..n.min(5)].join(", ")
+        );
     }
     if !found.dlcs.is_empty() {
         text += &format!("dlc:        {}\n", found.dlcs.len());
@@ -683,29 +673,19 @@ fn grouped(n: u64) -> String {
     out
 }
 
-/// `1.2 GB` (decimal units, one decimal above a kilobyte).
-fn human_bytes(n: u64) -> String {
-    let mut value = n as f64;
-    for unit in ["B", "KB", "MB", "GB"] {
-        if value < 1000.0 {
-            return if unit == "B" {
-                format!("{n} B")
-            } else {
-                format!("{value:.1} {unit}")
-            };
-        }
-        value /= 1000.0;
-    }
-    format!("{value:.1} TB")
-}
-
 /// The one `inspect` line for a source's LZ4 facts.
-fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts) -> String {
+fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts, zstd_packed: bool) -> String {
+    // The runtime with the version it names itself with, as the source card's tile names it.
+    let named = |name: &str| match &f.runtime_version {
+        Some(v) => format!("{name} {v}"),
+        None => name.to_owned(),
+    };
     let runtime = match f.runtime.as_str() {
-        "forge_release" => "Forge release",
-        "forge_trace" => "Forge trace",
-        "other" => "other",
-        _ => "none",
+        "forge_release" | "other" => named("ampr_emu"),
+        // Forge's old trace runtime: still told apart, so a conversion replaces it.
+        "forge_trace" => "Forge trace".to_owned(),
+        "zstd" => named("ampr-emu-ng"),
+        _ => "none".to_owned(),
     };
     let state = if let Some(p) = &f.packed {
         let share = p
@@ -718,10 +698,6 @@ fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts) -> String {
         )
     } else if let Some(e) = &f.manifest_error {
         format!("damaged packs ({e})")
-    } else if let Some(j) = f.journal_bytes {
-        format!("traced, journal {}", human_bytes(j))
-    } else if f.runtime == "forge_trace" {
-        "traced, no journal yet".to_string()
     } else {
         format!("plain, runtime {runtime}")
     };
@@ -738,6 +714,10 @@ fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts) -> String {
     };
     let shipped = f.shipped_runtime_version;
     let action = match (f.runtime_action, f.runtime.as_str()) {
+        // Beside zstd packs core installs its zstd runtime, not ampr_emu (`lz4::plain`).
+        (Some("install" | "replace"), _) if zstd_packed => {
+            ", a conversion installs the zstd runtime".to_owned()
+        }
         (Some("install"), _) => format!(", a conversion installs ampr_emu {shipped}"),
         (Some("replace"), _) => {
             format!(", a conversion replaces the runtime with ampr_emu {shipped}")
@@ -752,53 +732,6 @@ fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts) -> String {
         _ => String::new(),
     };
     format!("LZ4 (AMPR): {state}{action}{index}{ampr}")
-}
-
-fn lz4_patch(path: &Path, unpatch: bool) -> ExitCode {
-    if unpatch {
-        return match ps5_dump_forge_core::lz4_unpatch(path) {
-            Ok(done) => {
-                eprintln!("ps5-dump-forge: {}", done.warning);
-                let mut text = format!(
-                    "unpatched {}: the release runtime is at fakelib/libSceAmpr.sprx, \
-                     ampr_emu.index lists {} files\n",
-                    path.display(),
-                    done.indexed
-                );
-                for removed in &done.removed {
-                    text += &format!("  deleted {removed}\n");
-                }
-                print_out(&text)
-            }
-            Err(e) => {
-                eprintln!("ps5-dump-forge: {e:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-    match ps5_dump_forge_core::lz4_patch(path) {
-        Ok(done) => {
-            eprintln!("ps5-dump-forge: {}", done.warning);
-            let mut text = format!(
-                "patched {} for LZ4 traces: the trace runtime is at fakelib/libSceAmpr.sprx, \
-                 ampr_emu.index lists {} files\n",
-                path.display(),
-                done.indexed
-            );
-            for removed in &done.removed {
-                text += &format!("  deleted the last session's {removed}\n");
-            }
-            text += "play the game, then copy ampr_commands.bin and ampr_emu.index from this \
-                     folder to your computer and pack the original dump with --to lz4 \
-                     --lz4-traces <ampr_commands.bin>; each launch overwrites the previous \
-                     session's trace\n";
-            print_out(&text)
-        }
-        Err(e) => {
-            eprintln!("ps5-dump-forge: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
 }
 
 /// stdout, without the panic `print!` has on a closed pipe.
@@ -839,7 +772,10 @@ fn convert(request: ConvertRequest) -> ExitCode {
                     // Cancel first; a closing console can fail the write, which must not panic.
                     jobs.cancel(job);
                     cancelled = true;
-                    let _ = writeln!(std::io::stderr(), "ps5-dump-forge: cancelling...");
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ps5-dump-forge: cancelling... (press Ctrl-C again to quit now)"
+                    );
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break Err("job vanished".to_string()),
@@ -887,88 +823,6 @@ mod tests {
         s.split_whitespace().map(OsString::from).collect()
     }
 
-    #[test]
-    fn parses_convert() {
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to exfat -o /o/x.exfat --threads 2"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.format, Format::Exfat);
-        assert_eq!(r.output, PathBuf::from("/o/x.exfat"));
-        assert_eq!(r.compression_threads, Some(2));
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to PKG -o /o/x.pkg"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.format, Format::Pkg);
-        assert_eq!(r.inner, None);
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to ffpfsc --inner ffpkg -o /o/x"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!((r.format, r.inner), (Format::Ffpfsc, Some(Format::Ffpkg)));
-        assert!(!r.remove_backport);
-        assert!(!r.full_verify, "fast by default");
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to folder --remove-backport -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert!(r.remove_backport);
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to ffpkg --full-verify -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert!(r.full_verify);
-        assert_eq!(r.kraken_level, KrakenLevel::Fast, "fast by default");
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to pkg --kraken smallest -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.kraken_level, KrakenLevel::Smallest);
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to pkg --kraken stored -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.kraken_level, KrakenLevel::Stored);
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to ffpfsc --level 0 -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.ffpfsc_level, 0);
-    }
-
-    #[test]
-    fn rejects_bad_args() {
-        assert!(parse_args(args("convert /g")).is_err());
-        assert!(parse_args(args("convert /g --to zip -o x")).is_err());
-        assert!(parse_args(args("convert /g --to exfat --inner exfat -o x")).is_err());
-        assert!(parse_args(args("convert /g --to ffpfsc --inner pkg -o x")).is_err());
-        assert!(parse_args(args("convert /g --to ffpfsc --inner ffpfsc -o x")).is_err());
-        assert!(parse_args(args("inspect")).is_err());
-        assert!(parse_args(args("inspect a b")).is_err());
-        assert!(parse_args(args("frob /g")).is_err());
-        assert!(parse_args(args("inspect /g --bogus")).is_err());
-        assert!(parse_args(args("convert /g --to exfat --full-verify=yes -o x")).is_err());
-        assert!(parse_args(args("convert /g --to pkg --kraken medium -o x")).is_err());
-        assert!(parse_args(args("convert /g --to exfat --kraken fast -o x")).is_err());
-        assert!(parse_args(args("convert /g --to ffpfsc --level 10 -o x")).is_err());
-        assert!(parse_args(args("convert /g --to ffpfsc --level -1 -o x")).is_err());
-        assert!(parse_args(args("convert /g --to exfat --level 5 -o x")).is_err());
-        assert!(matches!(
-            parse_args(args("inspect /g --json")),
-            Ok(Cli::Inspect { path, json: true, password_stdin: false }) if path == Path::new("/g")
-        ));
-        assert!(matches!(parse_args(args("help")), Ok(Cli::Help)));
-    }
-
     fn convert(s: &str) -> Result<ConvertRequest, String> {
         match parse_args(args(s)) {
             Ok(Cli::Convert { request: r, .. }) => Ok(r),
@@ -978,67 +832,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_lz4_in_place() {
-        let r = convert("convert /d/game.ffpkg --lz4-trace --lz4-in-place --lz4-trace-space 128")
-            .unwrap();
-        assert_eq!(
-            (r.format, r.lz4, r.lz4_in_place, r.lz4_trace_space_mib),
-            (Format::Ffpkg, Some(Lz4Mode::Trace), true, 128)
-        );
-        assert_eq!(r.output, Path::new("/d/game.ffpkg"));
-        let r = convert("convert /d/game.EXFAT --lz4-unpatch --lz4-in-place").unwrap();
-        assert_eq!(
-            (r.format, r.lz4, r.lz4_in_place),
-            (Format::Exfat, Some(Lz4Mode::Unpatch), true)
-        );
-        let r = convert("convert /g --to folder --lz4-unpatch -o x").unwrap();
-        assert_eq!((r.lz4, r.lz4_in_place), (Some(Lz4Mode::Unpatch), false));
-        for bad in [
-            "convert /d/game.exfat --lz4-in-place",
-            "convert /d/game.exfat --lz4-unpack --lz4-in-place",
-            "convert /d/game.exfat --lz4-trace --lz4-unpatch --lz4-in-place",
-            "convert /d/game.exfat --lz4-trace --lz4-in-place --to exfat",
-            "convert /d/game.exfat --lz4-trace --lz4-in-place -o y.exfat",
-            "convert /d/game.ffpfs --lz4-trace --lz4-in-place",
-            "convert /d/game --lz4-unpatch --lz4-in-place",
-            "convert /g --to lz4 --lz4-unpatch -o x",
-            "convert /g --to folder --lz4-unpack --lz4-unpatch -o x",
-        ] {
-            assert!(convert(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
     fn rejects_bad_lz4_combinations() {
         for bad in [
             "convert /g --to lz4 --lz4-unpack -o x",
-            "convert /g --to folder --lz4-trace --lz4-unpack -o x",
-            "convert /g --to folder --lz4-profile r.toml -o x",
-            "convert /g --to lz4 --lz4-trace -o x",
-            "convert /g --to ffpfs --lz4-trace -o x",
-            "convert /g --to ffpfsc --lz4-trace -o x",
-            "convert /g --to pkg --lz4-trace -o x",
-            "convert /g --to folder --lz4-trace-space 8 -o x",
-            "convert /g --to lz4 --lz4-trace-space 8 -o x",
-            "convert /g --to folder --lz4-trace --lz4-trace-space 0 -o x",
-            "convert /g --to folder --lz4-trace --lz4-trace-space 100 -o x",
-            "convert /g --to folder --lz4-trace --lz4-trace-space 1088 -o x",
-            "convert /g --to folder --lz4-trace --lz4-trace-space 5000 -o x",
-            "convert /g --to folder --lz4-trace --lz4-trace-space x -o x",
-            "convert /g --to folder --lz4-trace --lz4-trace-space -o",
-            "convert /g --to lz4 --lz4-profile -o x",
-            "convert /g --to folder --lz4-traces t.bin -o x",
-            "convert /g --to exfat --lz4-traces t.bin -o x",
-            "convert /g --to lz4 --lz4-profile r.toml --lz4-traces t.bin -o x",
-            "convert /g --to lz4 --lz4-traces",
+            "convert /g --to lz4 --lz4-profile r.toml -o x",
             "convert /g --to lz4 --inner exfat -o x",
             "convert /g --to lz4 --kraken fast -o x",
             "convert /g --to lz4 --level 5 -o x",
             "convert /g --to lz4 --lz4-pack -o x",
             "convert /g --to pkg --lz4-pack -o x",
-            "convert /g --to exfat --lz4-pack --lz4-trace -o x",
             "convert /g --to exfat --lz4-pack --lz4-unpack -o x",
-            "convert /g --lz4-trace",
         ] {
             assert!(convert(bad).is_err(), "{bad}");
         }

@@ -5,7 +5,7 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use ps5_dump_forge_fpkg::FpkgSource;
 use ps5_dump_forge_pfs::{PfsHeader, PfsSource};
 use ps5upload_fpkg::exfat::ExFat;
@@ -61,9 +61,15 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
     let mut pfs_findings = Vec::new();
     let mut cnt_id = None;
     let mut forge_version = None;
-    let mut tree = if kind == Kind::Pkg {
+    let mut patch = false;
+    // A NAS share or a peer: the tree only (the format facts below read a local file).
+    let net = crate::net::is_network(path);
+    let mut tree = if net {
+        open_source(path, kind, &AtomicBool::new(false))?
+    } else if kind == Kind::Pkg {
         let pkg =
             FpkgSource::open(path, None).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        patch = pkg.is_patch();
         (details, cnt_id) = pkg_header(path)?;
         details.extend(pkg.details());
         Box::new(JunkFiltered::new(Box::new(pkg)))
@@ -143,6 +149,11 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         open_source(path, kind, &AtomicBool::new(false))?
     };
     let (mut info, mut findings) = preflight::input(tree.as_mut());
+    // A patch lists only what it carries whole (eboot.bin often not): its root is no game's.
+    if patch {
+        info.additional_content = false;
+        findings.clear();
+    }
     findings.append(&mut pfs_findings);
     if info.content_id.is_none() {
         info.content_id = cnt_id;
@@ -153,7 +164,7 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
             .as_deref()
             .and_then(preflight::title_from_content_id);
     }
-    if kind == Kind::Exfat {
+    if kind == Kind::Exfat && !net {
         let g = ExFat::open(path)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?
             .geometry();
@@ -185,13 +196,17 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         }
     }
     if matches!(kind, Kind::Exfat | Kind::Ffpkg | Kind::Ffpfs | Kind::Ffpfsc) {
-        let len = std::fs::metadata(path)?.len();
+        let len = if net {
+            crate::net::seen(path)?.0
+        } else {
+            std::fs::metadata(path)?.len()
+        };
         details.push(format!("image file: {len} bytes"));
         if len % (64 * 1024) != 0 {
             findings.push("the image size is not a multiple of 64 KiB".to_string());
         }
     }
-    if matches!(kind, Kind::Exfat | Kind::Ffpkg) {
+    if matches!(kind, Kind::Exfat | Kind::Ffpkg) && !net {
         forge_version = std::fs::File::open(path)
             .ok()
             .and_then(|mut f| maker_version(&mut f, kind == Kind::Exfat));
@@ -240,7 +255,18 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
     };
     let dlcs = crate::dlc::find(tree.as_mut(), info.content_id.as_deref());
     let cover = cover(tree.as_mut());
-    let lz4 = lz4_facts(tree.as_mut(), &mut findings);
+    // A patch is never converted, so what a conversion would do to its AMPR runtime is moot.
+    let lz4 = if patch {
+        None
+    } else {
+        lz4_facts(tree.as_mut(), &mut findings)
+    };
+    let zstd_packed = crate::zstd_pack::packed(tree.as_mut());
+    let unsigned = if patch {
+        Vec::new()
+    } else {
+        crate::fself::unsigned(tree.as_mut())
+    };
     let files: Vec<InspectFile> = tree
         .files()
         .iter()
@@ -254,6 +280,7 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         describe: tree.describe(),
         title_id: info.title_id,
         content_id: info.content_id,
+        additional_content: info.additional_content,
         title_name,
         title_names,
         version,
@@ -273,7 +300,15 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         details,
         findings,
         lz4,
+        zstd_packed,
         archive,
+        interrupted_edit: kind != Kind::Folder
+            && !net
+            && ps5_dump_forge_patch::journal_path(path)
+                .symlink_metadata()
+                .is_ok(),
+        patch,
+        unsigned,
     })
 }
 
@@ -333,22 +368,19 @@ fn archive_tree(
     format: ps5_dump_forge_archive::ArchiveFormat,
 ) -> anyhow::Result<(ArchiveTree, crate::ArchiveFacts)> {
     let cancel = AtomicBool::new(false);
-    let password = crate::archive::password(path, password, &cancel)?;
-    let password = password.as_deref();
-    let listing = ps5_dump_forge_archive::list(path, password)?;
-    let root = crate::library::archive_game_root(path, password, &listing, &cancel)?;
+    // The successful check's listing and game folder (its call of `extra` is the last).
+    let seen = std::cell::RefCell::new(None);
+    let extra = |listing: &ps5_dump_forge_archive::Listing, root: &str| {
+        let keep = archive_reads(&game_files(listing, root));
+        *seen.borrow_mut() = Some((listing.clone(), root.to_string()));
+        keep.into_iter()
+            .map(|(p, n)| (format!("{root}{p}"), n))
+            .collect()
+    };
+    let (_, mut bytes) = crate::archive::password_reading(path, password, &extra, &cancel)?;
+    let (listing, root) = seen.take().context("the archive was not listed")?;
     let under = |p: &str| p.strip_prefix(root.as_str()).map(str::to_string);
-    let files: Vec<SourceFile> = listing
-        .entries
-        .iter()
-        .filter(|e| !e.dir)
-        .filter_map(|e| {
-            Some(SourceFile {
-                path: under(&e.path)?,
-                size: e.size,
-            })
-        })
-        .collect();
+    let files = game_files(&listing, &root);
     let dirs = listing
         .entries
         .iter()
@@ -356,14 +388,6 @@ fn archive_tree(
         .filter_map(|e| under(&e.path))
         .filter(|d| !d.is_empty())
         .collect();
-    let keep = archive_reads(&files);
-    let mut bytes = ps5_dump_forge_archive::read_heads(
-        path,
-        password,
-        &|p, _| under(p).and_then(|p| keep.get(&p).copied()),
-        keep.values().sum(),
-        &cancel,
-    )?;
     let bytes = files
         .iter()
         .filter_map(|f| {
@@ -394,6 +418,18 @@ fn archive_tree(
         },
         facts,
     ))
+}
+
+/// The files of an archive's game folder `root`, paths relative to it.
+fn game_files(listing: &ps5_dump_forge_archive::Listing, root: &str) -> Vec<SourceFile> {
+    (listing.entries.iter().filter(|e| !e.dir))
+        .filter_map(|e| {
+            Some(SourceFile {
+                path: e.path.strip_prefix(root)?.to_string(),
+                size: e.size,
+            })
+        })
+        .collect()
 }
 
 /// The largest `ampr_emu.index` an archive's inspection reads (for [`Lz4Facts::index`]).
@@ -438,6 +474,10 @@ fn archive_reads(files: &[SourceFile]) -> BTreeMap<String, u64> {
             keep.insert(f.path.clone(), n);
         }
     }
+    // Past the budget, each executable's header (64 B) for `fself::unsigned`.
+    for f in files.iter().filter(|f| crate::fself::executable(&f.path)) {
+        keep.entry(f.path.clone()).or_insert(f.size.min(0x40));
+    }
     keep
 }
 
@@ -451,7 +491,6 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         tree.files().iter().find(|f| f.path == path).map(|f| f.size)
     };
     let imports_ampr = crate::lz4::imports_ampr(tree);
-    let journal_bytes = size(tree, JOURNAL);
     let rt = crate::lz4::runtime_of(tree);
     let kind = rt.kind;
     let mut packed = None;
@@ -475,16 +514,25 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         }
     }
     let artifact = holds_packs
-        || journal_bytes.is_some()
+        || size(tree, JOURNAL).is_some()
         || size(tree, INDEX).is_some()
-        || matches!(kind, RuntimeKind::ForgeRelease | RuntimeKind::ForgeTrace);
+        || matches!(
+            kind,
+            RuntimeKind::ForgeRelease | RuntimeKind::ForgeTrace | RuntimeKind::Zstd
+        );
     if !imports_ampr && !artifact {
         return None;
     }
     // As a plain conversion sees it (`lz4::plain`): a runtime it installs or replaces is
     // compared at the release runtime's size.
-    let action = rt.action(imports_ampr, holds_packs);
-    let index = if holds_packs || action == RuntimeAction::Untouched {
+    // A zstd-packed game keeps its index too, and gets the zstd runtime (`lz4::plain`).
+    let zstd_packed = !holds_packs && crate::zstd_pack::packed(tree);
+    let action = if zstd_packed {
+        rt.zstd_action()
+    } else {
+        rt.action(imports_ampr, holds_packs)
+    };
+    let index = if holds_packs || zstd_packed || action == RuntimeAction::Untouched {
         None
     } else {
         let files = crate::lz4::plain_listing(tree.files(), action);
@@ -507,6 +555,7 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
     let runtime = match kind {
         RuntimeKind::ForgeRelease => "forge_release",
         RuntimeKind::ForgeTrace => "forge_trace",
+        RuntimeKind::Zstd => "zstd",
         RuntimeKind::Other => "other",
         RuntimeKind::None => "none",
     };
@@ -517,17 +566,15 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         runtime: runtime.to_string(),
         shipped_runtime_version: ps5_dump_forge_lz4::runtime::VERSION,
         runtime_action: name(action),
-        // Pack writes packs; Unpack (a packed source) writes none (`lz4::prepare`).
-        pack_runtime_action: name(rt.action(imports_ampr, !holds_packs)),
+        // Unpack (a packed source) writes no packs; Pack with ampr_emu (`lz4::prepare`). Pack
+        // with ampr-emu-ng keeps it where `runtime` is `zstd`, else installs it.
+        pack_runtime_action: name(if holds_packs {
+            rt.action(imports_ampr, false)
+        } else {
+            rt.pack_action(crate::Lz4Runtime::AmprEmu)
+        }),
         runtime_version: rt.version,
         index,
-        journal_bytes,
-        traces_zip: (journal_bytes.is_some() && size(tree, INDEX).is_some()).then(|| {
-            let param = size(tree, "sce_sys/param.json")
-                .filter(|&s| s <= preflight::MAX_PARAM_JSON)
-                .and_then(|_| tree.read("sce_sys/param.json").ok());
-            traces_zip_name(param.as_deref())
-        }),
     })
 }
 
@@ -658,6 +705,26 @@ pub(crate) fn title_name(param: &Value) -> Option<String> {
         .or_else(|| name(param))
 }
 
+/// The English title in `localizedParameters`: the default language's when it is English (an
+/// `en-GB` game keeps its own), else `en-US`, then `en-GB`, then any `en*`; a blank one doesn't
+/// count, so the default-language title still names the game.
+fn english_title(param: &Value) -> Option<String> {
+    let localized = param.get("localizedParameters")?.as_object()?;
+    let default =
+        (localized.get("defaultLanguage").and_then(Value::as_str)).filter(|d| d.starts_with("en"));
+    let name = |v: &Value| {
+        let n = v.get("titleName")?.as_str()?;
+        (!n.trim().is_empty()).then(|| n.to_string())
+    };
+    (default.iter().copied().chain(["en-US", "en-GB"]))
+        .find_map(|k| localized.get(k).and_then(name))
+        .or_else(|| {
+            (localized.iter())
+                .filter(|(k, _)| k.starts_with("en"))
+                .find_map(|(_, v)| name(v))
+        })
+}
+
 /// Every `localizedParameters` title by language tag (`en-US`, `ru-RU`, ...), for the UI to
 /// pick the viewer's; `defaultLanguage` and entries without a string `titleName` are skipped.
 pub(crate) fn title_names(param: &Value) -> BTreeMap<String, String> {
@@ -772,9 +839,17 @@ fn base64(bytes: &[u8]) -> String {
 
 /// The finalized-image header and the content id from the CNT header. Two bounded reads.
 fn pkg_header(path: &Path) -> anyhow::Result<(Vec<String>, Option<String>)> {
-    const CNT_MAGIC: &[u8; 4] = b"\x7FCNT";
     let mut file = PkgFile::open(path).with_context(|| format!("{}", path.display()))?;
     let head = file.read_at(0, fih::HEADER_LEN)?;
+    // A patch package: its own header says where the patched package's container is.
+    if head.starts_with(b"\x7FLIH") {
+        let le = |at: usize| u64::from_le_bytes(head[at..at + 8].try_into().unwrap());
+        let (fih_at, cnt_at) = (le(0x20), le(0x30));
+        let details = vec![format!(
+            "LIH: patch, FIH at {fih_at:#x}, CNT at {cnt_at:#x}"
+        )];
+        return Ok((details, content_id(&file.read_at(cnt_at, 0x64)?)));
+    }
     let fih = fih::parse(&head)?;
     let mut details = vec![format!(
         "FIH: {} image, format {}, PFS at {:#x} ({} bytes), CNT at {:#x}",
@@ -785,23 +860,32 @@ fn pkg_header(path: &Path) -> anyhow::Result<(Vec<String>, Option<String>)> {
         fih.cnt_offset
     )];
     let cnt = file.read_at(fih.cnt_offset, 0x64)?;
-    if &cnt[..4] != CNT_MAGIC {
+    let id = content_id(&cnt);
+    if id.is_none() && &cnt[..4] != b"\x7FCNT" {
         details.push("no CNT container at the declared offset".to_string());
-        return Ok((details, None));
+    }
+    Ok((details, id))
+}
+
+/// The content id in a container's first 0x64 bytes; `None` without the `\x7FCNT` magic or a
+/// printable id.
+fn content_id(cnt: &[u8]) -> Option<String> {
+    if &cnt[..4] != b"\x7FCNT" {
+        return None;
     }
     let id: String = cnt[0x40..0x64]
         .iter()
         .take_while(|&&b| b != 0)
         .map(|&b| b as char)
         .collect();
-    let id = (!id.is_empty() && id.chars().all(|c| c.is_ascii_graphic())).then_some(id);
-    Ok((details, id))
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_graphic())).then_some(id)
 }
 
-/// `[GAME_NAME]-[TITLE_ID]` from the source, brackets included, e.g.
-/// `[Astro Bot]-[PPSA01234].ffpkg`; parts it lacks are left out, and with neither it is
-/// [`default_output`]'s name. An empty `dir` is the folder holding the source. `password`: an
-/// archive's (else its listing or `param.json` may be locked).
+/// The source's name by the `naming` template (`None`: [`crate::DEFAULT_NAMING`],
+/// `[GAME_NAME]-[TITLE_ID]`, e.g. `[Astro Bot]-[PPSA01234].ffpkg`; tokens and cleanup:
+/// [`Template`]); `pack` for `{pack}`, and [`Format::Lz4`] is LZ4 Pack into a folder. With
+/// nothing left it is [`default_output`]'s name. An empty `dir` is the folder holding the
+/// source. `password`: an archive's (else its listing or `param.json` may be locked).
 /// ponytail: the source is opened again (a folder scanned, a package's image walked) for
 /// every generated name, each format or folder change; metadata only, cache it per source
 /// if a big game makes that slow.
@@ -811,7 +895,11 @@ pub(crate) fn generated_output(
     dir: &Path,
     taken: &[PathBuf],
     password: Option<&str>,
+    pack: Option<crate::PackKind>,
+    naming: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
+    let template = parse_naming(naming.unwrap_or(crate::DEFAULT_NAMING)).map_err(|e| anyhow!(e))?;
+    let pack = pack.or((format == Format::Lz4).then_some(crate::PackKind::Lz4));
     let dir = &output_dir(source, dir)?;
     let info = match Kind::of(source)? {
         Kind::Archive(_) => archive_info(source, password)?,
@@ -820,14 +908,24 @@ pub(crate) fn generated_output(
             preflight::input(tree.as_mut()).0
         }
     };
-    let parts = NameParts::of(&info);
-    let mut stem = match parts.stem(usize::MAX) {
-        Some(stem) => stem,
-        None => default_stem(source, info.title_id)?,
+    let parts = NameParts::of(&info, pack, template);
+    let full = parts.stem(usize::MAX);
+    // Only a title or title id in the name identifies the game; without one (the template's
+    // text, a version) unrelated games would share a name.
+    let named = !full.is_empty() && parts.identified();
+    // What a template that renders (or is cut) to nothing falls back to; looked up only then
+    // (a peer or NAS source answers a stat for it).
+    let fallback_cell = std::cell::OnceCell::new();
+    let fallback = || {
+        fallback_cell
+            .get_or_init(|| default_stem(source, info.title_id.clone()).ok())
+            .as_ref()
     };
-    if is_reserved_on_windows(&stem) {
-        stem.insert(0, '_');
-    }
+    let stem = match (named, if named { None } else { fallback() }) {
+        (true, _) => full,
+        (false, Some(f)) => f.clone(),
+        (false, None) => default_stem(source, info.title_id.clone())?,
+    };
     // The name can't be edited while it is generated, so it never names something that
     // exists or that a running job (`taken`) will publish: a rebuild becomes `-2`, `-3`, ...
     // (publishing still never replaces, should something take the name meanwhile).
@@ -837,20 +935,34 @@ pub(crate) fn generated_output(
         } else {
             format!("-{n}")
         };
-        // Within the name limit (what ShadowMountPlus can mount): the game name is cut first,
-        // the title id kept, then the suffix.
+        // Within the name limit (what ShadowMountPlus can mount): the version is left out when
+        // the rest doesn't fit even without the game name, then the game name is cut, then the
+        // rest; the suffix kept.
         let max = preflight::stem_limit(format);
-        let stem = if stem.len() + suffix.len() > max {
-            let room = max.saturating_sub(suffix.len());
-            match &parts.name {
-                Some(_) => parts.stem(room).unwrap_or_default(),
-                None => cut(&stem, room).to_string(),
+        let fit = |room: usize| {
+            let fitted = match (stem.len() > room, named) {
+                (false, _) => stem.clone(),
+                (true, true) => parts.stem(room),
+                (true, false) => cut(&stem, room).trim_end_matches(['.', ' ']).to_string(),
+            };
+            // The cut took the game away (a title of wide characters, or the template's own text
+            // filling the room before `{title_id}`): never an empty name, which would be the
+            // folder itself or a bare `.ext`, nor one unrelated games would share.
+            let lost = fitted.is_empty() || named && !parts.kept_in(&fitted);
+            match if lost { fallback() } else { None } {
+                Some(f) => cut(f, room).trim_end_matches(['.', ' ']).to_string(),
+                None => fitted,
             }
-        } else {
-            stem.clone()
         };
+        let room = max.saturating_sub(suffix.len());
+        let mut stem = fit(room);
+        // A device name (`CON.`, ...) gets a `_` in front, which needs a byte of the room too.
+        if is_reserved_on_windows(&stem) {
+            stem = fit(room.saturating_sub(1));
+            stem.insert(0, '_');
+        }
         let path = with_extension(dir, &format!("{stem}{suffix}"), format);
-        if !taken.contains(&path) && std::fs::symlink_metadata(&path).is_err() {
+        if !taken.contains(&path) && !crate::net::exists(&path) {
             return Ok(path);
         }
     }
@@ -860,69 +972,249 @@ pub(crate) fn generated_output(
     )
 }
 
-/// The download name of a source's LZ4 traces, from its `param.json` bytes: the generated
-/// output stem ([`NameParts::stem`], `[GAME_TITLE]-[TITLE_ID]`, the title cut first to keep the
-/// stem within 63 bytes) and `-amprtrace.zip`; either part alone without the other,
-/// `amprtrace.zip` with neither.
-pub(crate) fn traces_zip_name(param_json: Option<&[u8]>) -> String {
-    let info = param_json.map(preflight::parse_param).unwrap_or_default();
-    download_name(&info, "amprtrace.zip")
+/// One piece of a naming [`Template`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Token {
+    /// The English title (`localizedParameters` `en-US`, `en-GB`, then any `en*`), else the
+    /// default-language one.
+    Title,
+    TitleId,
+    Version,
+    Pack,
+    Region,
+    Fw,
 }
 
-/// `[GAME_TITLE]-[TITLE_ID]-<suffix>` as [`traces_zip_name`] builds it, `<suffix>` alone
-/// without either part.
-pub(crate) fn download_name(info: &GameInfo, suffix: &str) -> String {
-    match name_stem(info) {
-        Some(stem) => format!("{stem}-{suffix}"),
-        None => suffix.to_string(),
+/// A parsed naming template: its own text and the tokens `{title}`, `{title_id}`,
+/// `{version}`, `{pack}`, `{region}`, `{fw}`, in order.
+///
+/// After the values go in, the name is cleaned up, in order: an empty `[]` or `()` is
+/// removed (again until none is left), a run of one separator (`-`, `_`, a space) becomes
+/// one, and `-`, `_`, `.` and spaces are trimmed from both ends. The cleanup touches only the
+/// template's own text, never a value's (a title keeps its own `--`). Examples:
+/// `[{title}]-[{title_id}]-[{version}]` without a version gives `[T]-[ID]`;
+/// `{title}-{version}-{pack}` without a version gives `T-zstd`; `{title} ({pack})` on a
+/// Convert gives `T`.
+/// ponytail: a spaced separator like ` - ` can double (`T - - zstd`) when a value is missing.
+pub(crate) struct Template(Vec<Result<char, Token>>);
+
+/// `template` parsed, or why it can't name an output ([`crate::naming_problem`]).
+pub(crate) fn parse_naming(template: &str) -> Result<Template, String> {
+    const MAX: usize = 128;
+    if template.len() > MAX {
+        return Err(format!("a naming template is at most {MAX} bytes"));
     }
+    // The text NFC, as a file name wants it.
+    let mut pieces = Vec::new();
+    let mut text = String::new();
+    let flush = |text: &mut String, pieces: &mut Vec<_>| {
+        pieces.extend(text.nfc().map(Ok));
+        text.clear();
+    };
+    let mut rest = template;
+    while let Some(c) = rest.chars().next() {
+        if c == '{' {
+            let close = rest
+                .find('}')
+                .ok_or("the naming template has a { with no }")?;
+            let token = match &rest[1..close] {
+                "title" => Token::Title,
+                "title_id" => Token::TitleId,
+                "version" => Token::Version,
+                "pack" => Token::Pack,
+                "region" => Token::Region,
+                "fw" => Token::Fw,
+                other => {
+                    return Err(format!(
+                        "the naming template has an unknown {{{other}}}: use {{title}}, \
+                         {{title_id}}, {{version}}, {{pack}}, {{region}} or {{fw}}"
+                    ));
+                }
+            };
+            // Each part once: a name never says the same thing twice.
+            if pieces.contains(&Err(token)) {
+                return Err(format!(
+                    "the naming template has {} twice: use each part once",
+                    &rest[..=close]
+                ));
+            }
+            flush(&mut text, &mut pieces);
+            pieces.push(Err(token));
+            rest = &rest[close + 1..];
+            continue;
+        }
+        if c == '}' {
+            return Err("the naming template has a } with no {".to_string());
+        }
+        if c.is_control() || "/\\:*?\"<>|".contains(c) {
+            return Err(format!("the naming template can't hold {c:?}"));
+        }
+        text.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    flush(&mut text, &mut pieces);
+    if !pieces
+        .iter()
+        .any(|p| matches!(p, Err(Token::Title | Token::TitleId)))
+    {
+        return Err("the naming template needs {title} or {title_id}".to_string());
+    }
+    Ok(Template(pieces))
 }
 
-/// The generated stem, `[GAME_TITLE]-[TITLE_ID]` within 63 bytes; `None` with neither part.
-pub(crate) fn name_stem(info: &GameInfo) -> Option<String> {
-    NameParts::of(info).stem(63)
-}
-
-/// The parts of a generated name: the game's title made file-safe (`None` when nothing of it
-/// is left) and the title id in brackets.
+/// A [`Template`] with the values the source has: the game's title made file-safe, the title
+/// id, the version (when file-safe) and the pack kind; a missing one is empty.
 struct NameParts {
-    name: Option<String>,
-    id: Option<String>,
+    template: Template,
+    title: String,
+    title_id: String,
+    version: String,
+    pack: String,
+    /// `USA`, `EUR`, `JPN`, `ASIA` or `KOR`, from the content id's first two letters.
+    region: String,
+    /// The firmware the game requires, `7.00` (param.json `requiredSystemSoftwareVersion`).
+    fw: String,
 }
 
 impl NameParts {
-    fn of(info: &GameInfo) -> Self {
+    fn of(info: &GameInfo, pack: Option<crate::PackKind>, template: Template) -> Self {
+        let param = info.param_json.as_ref();
+        let version = param
+            .and_then(|p| p.get("contentVersion"))
+            .and_then(Value::as_str)
+            // No dot at either end: a name can't end in one (some filesystems drop it).
+            .filter(|v| {
+                v.len() <= 16
+                    && !v.starts_with('.')
+                    && !v.ends_with('.')
+                    && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+            });
         Self {
-            name: info
-                .param_json
-                .as_ref()
-                .and_then(title_name)
-                .map(|n| file_safe(&n))
-                .filter(|n| !n.is_empty()),
-            id: info.title_id.as_ref().map(|id| format!("[{id}]")),
+            template,
+            title: param
+                .and_then(|p| {
+                    // One that file-safe leaves empty (all symbols) gives way too.
+                    let safe = |n: String| Some(file_safe(&n)).filter(|n| !n.is_empty());
+                    english_title(p)
+                        .and_then(safe)
+                        .or_else(|| title_name(p).and_then(safe))
+                })
+                .unwrap_or_default(),
+            title_id: info.title_id.clone().unwrap_or_default(),
+            version: version.unwrap_or_default().to_string(),
+            pack: match pack {
+                Some(crate::PackKind::Zstd) => "zstd",
+                Some(crate::PackKind::Lz4) => "LZ4",
+                None => "",
+            }
+            .to_string(),
+            region: match info.content_id.as_deref().and_then(|c| c.get(..2)) {
+                Some("UP") => "USA",
+                Some("EP") => "EUR",
+                Some("JP") => "JPN",
+                Some("HP") => "ASIA",
+                Some("KP") => "KOR",
+                _ => "",
+            }
+            .to_string(),
+            fw: param
+                .and_then(|p| p.get("requiredSystemSoftwareVersion"))
+                .and_then(Value::as_str)
+                .and_then(bcd)
+                .unwrap_or_default(),
         }
     }
 
-    /// `[GAME_NAME]-[TITLE_ID]` within `max` bytes, the name cut first ([`stem_with`]); `None`
-    /// with neither part.
-    fn stem(&self, max: usize) -> Option<String> {
-        (self.name.is_some() || self.id.is_some())
-            .then(|| stem_with(self.name.as_deref(), self.id.as_deref().unwrap_or(""), max))
+    /// The name within `max` bytes, empty with no value at all: when it is too long the title
+    /// is cut (at a character boundary, no trailing `.` or space; left out if nothing of it
+    /// fits), but first the version is left out when the name doesn't fit even without the
+    /// title; then the whole is cut.
+    fn stem(&self, max: usize) -> String {
+        let fits_without_title = self.render("", &self.version).len() <= max;
+        let version = if fits_without_title {
+            &self.version[..]
+        } else {
+            ""
+        };
+        let full = self.render(&self.title, version);
+        let titles = (self.template.0.iter())
+            .filter(|p| matches!(p, Err(Token::Title)))
+            .count();
+        if full.len() <= max || titles == 0 || self.title.is_empty() {
+            return cut(&full, max).trim_end_matches(['.', ' ']).to_string();
+        }
+        // The title is a value, untouched by the cleanup, so the rest's length is fixed.
+        let others = full.len() - titles * self.title.len();
+        let room = max.saturating_sub(others) / titles;
+        let title = cut(&self.title, room).trim_end_matches(['.', ' ']);
+        let name = self.render(title, version);
+        cut(&name, max).trim_end_matches(['.', ' ']).to_string()
     }
-}
 
-/// `[name]-` before `id` (bracketed, or empty), the name cut to keep the whole within `max`
-/// bytes and left out if nothing of it fits.
-fn stem_with(name: Option<&str>, id: &str, max: usize) -> String {
-    let sep = usize::from(!id.is_empty());
-    let room = max.saturating_sub(id.len() + sep + 2);
-    let name = name
-        .map(|n| cut(n, room).trim_end_matches(['.', ' ']))
-        .filter(|n| !n.is_empty());
-    match name {
-        Some(n) if id.is_empty() => format!("[{n}]"),
-        Some(n) => format!("[{n}]-{id}"),
-        None => cut(id, max).to_string(),
+    /// Whether the name holds the title or the title id: the template has the token and the
+    /// source the value.
+    fn identified(&self) -> bool {
+        self.template.0.iter().any(|p| match p {
+            Err(Token::Title) => !self.title.is_empty(),
+            Err(Token::TitleId) => !self.title_id.is_empty(),
+            _ => false,
+        })
+    }
+
+    /// Whether `name` (this template, cut) still holds the title id or the start of the title.
+    // ponytail: the title's first character is the test, so template text that happens to hold
+    // it passes; a title id is matched whole.
+    fn kept_in(&self, name: &str) -> bool {
+        self.template.0.iter().any(|p| match p {
+            Err(Token::Title) => self.title.chars().next().is_some_and(|c| name.contains(c)),
+            Err(Token::TitleId) => !self.title_id.is_empty() && name.contains(&self.title_id),
+            _ => false,
+        })
+    }
+
+    /// The template with `title`, the title id, `version` and the pack kind in, cleaned up as
+    /// [`Template`] says (the template's own text only).
+    fn render(&self, title: &str, version: &str) -> String {
+        let mut pieces: Vec<Result<char, &str>> = (self.template.0.iter())
+            .map(|p| match p {
+                Ok(c) => Ok(*c),
+                Err(Token::Title) => Err(title),
+                Err(Token::TitleId) => Err(&self.title_id[..]),
+                Err(Token::Version) => Err(version),
+                Err(Token::Pack) => Err(&self.pack[..]),
+                Err(Token::Region) => Err(&self.region[..]),
+                Err(Token::Fw) => Err(&self.fw[..]),
+            })
+            .filter(|p| *p != Err(""))
+            .collect();
+        let text = |p: Option<&Result<char, &str>>| p.and_then(|p| p.ok());
+        // Empty pairs, until none is left.
+        let mut i = 0;
+        while i + 1 < pieces.len() {
+            let pair = (text(pieces.get(i)), text(pieces.get(i + 1)));
+            if matches!(pair, (Some('['), Some(']')) | (Some('('), Some(')'))) {
+                pieces.drain(i..i + 2);
+                i = i.saturating_sub(1);
+            } else {
+                i += 1;
+            }
+        }
+        // A run of one separator as one.
+        pieces.dedup_by(|b, a| *a == *b && matches!(a, Ok('-' | '_' | ' ')));
+        let end = |p: Option<&Result<char, &str>>| matches!(text(p), Some('-' | '_' | '.' | ' '));
+        while end(pieces.last()) {
+            pieces.pop();
+        }
+        let lead = pieces.iter().take_while(|p| end(Some(p))).count();
+        (pieces[lead..].iter())
+            .map(|p| match p {
+                Ok(c) => c.to_string(),
+                Err(v) => v.to_string(),
+            })
+            // ponytail: the template's text and each value are NFC on their own, not the joined
+            // name, so a combining mark typed right after a value stays uncomposed; normalizing
+            // here would let the name shrink under the title's byte count in `stem`.
+            .collect()
     }
 }
 
@@ -932,6 +1224,9 @@ fn stem_with(name: Option<&str>, id: &str, max: usize) -> String {
 fn output_dir(source: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
     if !dir.as_os_str().is_empty() {
         return Ok(dir.to_path_buf());
+    }
+    if let Some(why) = crate::net::output_refusal(source) {
+        bail!("{why}");
     }
     let mut source =
         std::path::absolute(source).with_context(|| format!("{}", source.display()))?;
@@ -981,7 +1276,9 @@ fn default_stem(source: &Path, title_id: Option<String>) -> anyhow::Result<Strin
     Ok(match title_id {
         Some(id) => id,
         None => {
-            let stem = if source.is_dir() {
+            let stem = if source.is_dir()
+                || crate::net::is_network(source) && Kind::of(source)? == Kind::Folder
+            {
                 source.file_name()
             } else {
                 source.file_stem()
@@ -1000,6 +1297,12 @@ fn game_info(source: &Path, password: Option<&str>) -> anyhow::Result<GameInfo> 
     let kind = Kind::of(source)?;
     let info = match kind {
         Kind::Archive(_) => archive_info(source, password)?,
+        Kind::Folder if crate::net::is_network(source) => {
+            match crate::net::read_small(source, "sce_sys/param.json", preflight::MAX_PARAM_JSON)? {
+                Some(bytes) => preflight::parse_param(&bytes),
+                None => GameInfo::default(),
+            }
+        }
         // Straight from disk: naming an output needs no full scan of the folder.
         Kind::Folder => {
             let param = source.join("sce_sys").join("param.json");
@@ -1035,21 +1338,20 @@ fn game_info(source: &Path, password: Option<&str>) -> anyhow::Result<GameInfo> 
 
 /// An archive's `param.json` alone, from its game folder: no other file is unpacked.
 fn archive_info(source: &Path, password: Option<&str>) -> anyhow::Result<GameInfo> {
-    let cancel = AtomicBool::new(false);
-    let password = crate::archive::password(source, password, &cancel)?;
-    let password = password.as_deref();
-    let listing = ps5_dump_forge_archive::list(source, password)?;
-    let root = crate::library::archive_game_root(source, password, &listing, &cancel)?;
-    let param = format!("{root}sce_sys/param.json");
-    let mut files = ps5_dump_forge_archive::read_files(
-        source,
-        password,
-        &|p| p == param,
-        preflight::MAX_PARAM_JSON,
-        &cancel,
-    )?;
-    Ok(files
-        .remove(&param)
+    let param = match crate::archive::cached_param(source, password) {
+        Some((_, param)) => Some(param),
+        None => {
+            let cancel = AtomicBool::new(false);
+            let none = |_: &ps5_dump_forge_archive::Listing, _: &str| BTreeMap::new();
+            let (_, heads) = crate::archive::password_reading(source, password, &none, &cancel)?;
+            // Only the game folder's param.json is read with no extra.
+            heads
+                .into_iter()
+                .find(|(p, _)| p.ends_with("sce_sys/param.json"))
+                .map(|(_, b)| b)
+        }
+    };
+    Ok(param
         .map(|b| preflight::parse_param(&b))
         .unwrap_or_default())
 }
@@ -1071,89 +1373,13 @@ mod tests {
         assert!(!keep.contains_key(&index.path), "{keep:?}");
         let keep = archive_reads(&[index.clone(), file("eboot.bin", 1 << 20)]);
         assert!(keep.contains_key(&index.path), "{keep:?}");
-    }
-
-    #[test]
-    fn generated_names() {
-        assert_eq!(file_safe("ASTRO BOT™"), "ASTRO BOT");
-        assert_eq!(file_safe("  a/b:c*d?  e  "), "abcd e");
-        assert_eq!(file_safe("Marvel's Spider-Man 2"), "Marvel's Spider-Man 2");
-        assert_eq!(file_safe("..hidden.."), "hidden");
-        assert_eq!(file_safe("ゼルダ"), "ゼルダ");
-        assert_eq!(file_safe(&"x".repeat(200)).len(), MAX_NAME_BYTES);
-        assert!(file_safe(&"각".repeat(80)).len() <= MAX_NAME_BYTES);
-        for name in [
-            "CON",
-            "con.Game",
-            "LPT1",
-            "nul .x",
-            "Com9.a",
-            "COM¹.Game",
-            "lpt³",
-            "COM0",
-        ] {
-            assert!(is_reserved_on_windows(name), "{name}");
-        }
-        for name in [
-            "CONSOLE",
-            "CON-PPSA01234-7.00",
-            "COM10",
-            "LPT",
-            "Game",
-            "COM¹²",
-        ] {
-            assert!(!is_reserved_on_windows(name), "{name}");
-        }
-
-        let root = crate::test_dir("generated-name");
-        let game = root.join("game");
-        std::fs::create_dir_all(game.join("sce_sys")).unwrap();
-        std::fs::write(game.join("eboot.bin"), b"x").unwrap();
-        std::fs::write(
-            game.join("sce_sys/param.json"),
-            r#"{"titleId":"PPSA01234","requiredSystemSoftwareVersion":"0x0700000000000000",
-                "localizedParameters":{"defaultLanguage":"en-US","en-US":{"titleName":"Astro: Bot"}}}"#,
-        )
-        .unwrap();
-        // No firmware in the name, whatever param.json says.
-        assert_eq!(
-            generated_output(&game, Format::Exfat, &root, &[], None).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234].exfat")
-        );
-        assert_eq!(
-            generated_output(&game, Format::Folder, &root, &[], None).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]")
-        );
-        // Taken names are skipped, never offered.
-        std::fs::write(root.join("[Astro Bot]-[PPSA01234].exfat"), b"").unwrap();
-        std::fs::write(root.join("[Astro Bot]-[PPSA01234]-2.exfat"), b"").unwrap();
-        assert_eq!(
-            generated_output(&game, Format::Exfat, &root, &[], None).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]-3.exfat")
-        );
-        // A running job's output counts as taken too.
-        let running = [root.join("[Astro Bot]-[PPSA01234]-3.exfat")];
-        assert_eq!(
-            generated_output(&game, Format::Exfat, &root, &running, None).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]-4.exfat")
-        );
-        // No name: only the title id.
-        std::fs::write(
-            game.join("sce_sys/param.json"),
-            r#"{"titleId":"PPSA01234"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            generated_output(&game, Format::Ffpkg, &root, &[], None).unwrap(),
-            root.join("[PPSA01234].ffpkg")
-        );
-        // Nothing usable: the source's own name, still never a taken one.
-        std::fs::write(game.join("sce_sys/param.json"), "{}").unwrap();
-        std::fs::write(root.join("game.ffpkg"), b"").unwrap();
-        assert_eq!(
-            generated_output(&game, Format::Ffpkg, &root, &[], None).unwrap(),
-            root.join("game-2.ffpkg")
-        );
+        // Past the budget an executable still gets its header, for the unsigned check.
+        let keep = archive_reads(&[
+            file("eboot.bin", ARCHIVE_READ_BUDGET + 1),
+            file("data/level.bin", 1 << 30),
+        ]);
+        assert_eq!(keep.get("eboot.bin"), Some(&0x40), "{keep:?}");
+        assert!(!keep.contains_key("data/level.bin"), "{keep:?}");
     }
 
     #[test]
@@ -1175,15 +1401,26 @@ mod tests {
         std::fs::create_dir_all(game.join("sce_sys")).unwrap();
         std::fs::write(game.join("eboot.bin"), b"x").unwrap();
         let param = |name: &str| {
-            let json = format!(r#"{{"titleId":"PPSA01234","titleName":"{name}"}}"#);
+            let json = format!(
+                r#"{{"titleId":"PPSA01234","titleName":"{name}","contentVersion":"01.030.000","contentId":"UP9000-PPSA01234_00-ASTROBOT00000000","requiredSystemSoftwareVersion":"0x0700000000000000"}}"#
+            );
             std::fs::write(game.join("sce_sys/param.json"), json).unwrap();
         };
-        let stem = |p: &Path| p.file_stem().unwrap().to_str().unwrap().to_string();
+        // The name without the format's extension (a version's dots aren't one).
+        let stem = |p: &Path, f: Format| {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            match preflight::extension(f) {
+                Some(ext) => name.strip_suffix(&format!(".{ext}")).unwrap().to_string(),
+                None => name.to_string(),
+            }
+        };
         param(&"Long Game Name ".repeat(6));
-        // An LZ4 packed folder is named as a folder: no extension.
+        let d = None;
+        // An LZ4 packed folder is named as an LZ4 Pack into a folder: no extension.
+        let lz4 = Some(crate::PackKind::Lz4);
         assert_eq!(
-            generated_output(&game, Format::Lz4, &root, &[], None).unwrap(),
-            generated_output(&game, Format::Folder, &root, &[], None).unwrap()
+            generated_output(&game, Format::Lz4, &root, &[], None, None, d).unwrap(),
+            generated_output(&game, Format::Folder, &root, &[], None, lz4, d).unwrap()
         );
         // Every output cuts it, a folder and a .pkg too.
         for (format, max) in [
@@ -1194,109 +1431,187 @@ mod tests {
             (Format::Pkg, 63),
             (Format::Folder, 63),
         ] {
-            let path = generated_output(&game, format, &root, &[], None).unwrap();
-            let s = match format {
-                Format::Folder => path.file_name().unwrap().to_str().unwrap().to_string(),
-                _ => stem(&path),
-            };
+            let path = generated_output(&game, format, &root, &[], None, None, d).unwrap();
+            let s = stem(&path, format);
             assert_eq!(s.len(), max, "{s}");
             assert!(s.starts_with("[Long Game Name Long"), "{s}");
             assert!(s.ends_with("]-[PPSA01234]"), "{s}");
             // With a `-N` suffix the name gives up more room.
             std::fs::write(&path, b"").unwrap();
-            let next = stem(&generated_output(&game, format, &root, &[], None).unwrap());
+            let next = generated_output(&game, format, &root, &[], None, None, d).unwrap();
+            let next = stem(&next, format);
             assert!(
                 next.len() <= max && next.ends_with("]-[PPSA01234]-2"),
                 "{next}"
             );
         }
+        // A Pack job's kind, when the naming has it, is kept within the limit.
+        let zstd = Some(crate::PackKind::Zstd);
+        let with_pack = Some("[{title}]-[{title_id}]-[{pack}]");
+        let s = stem(
+            &generated_output(&game, Format::Ffpfsc, &root, &[], None, zstd, with_pack).unwrap(),
+            Format::Ffpfsc,
+        );
+        assert!(s.len() == 58 && s.ends_with("]-[PPSA01234]-[zstd]"), "{s}");
         // Cut at a character boundary, never inside one, and no trailing space.
         param(&"ゼルダ ".repeat(12));
-        let pfsc = generated_output(&game, Format::Ffpfsc, &root, &[], None).unwrap();
-        let s = stem(&pfsc);
+        let pfsc = generated_output(&game, Format::Ffpfsc, &root, &[], None, None, d).unwrap();
+        let s = stem(&pfsc, Format::Ffpfsc);
         assert!(s.len() <= 58, "{s}");
         assert!(s.starts_with("[ゼルダ ゼルダ") && !s.contains(" ]"), "{s}");
         assert!(s.ends_with("]-[PPSA01234]"), "{s}");
         // A short name is left whole.
         param("Astro Bot");
         assert_eq!(
-            generated_output(&game, Format::Ffpfsc, &root, &[], None).unwrap(),
+            generated_output(&game, Format::Ffpfsc, &root, &[], None, None, d).unwrap(),
             root.join("[Astro Bot]-[PPSA01234].ffpfsc")
         );
+        // A template: its own text and order; a missing value's text is cleaned up.
+        let named = |template: &str, pack| {
+            let out = generated_output(
+                &game,
+                Format::Folder,
+                &root,
+                &[],
+                None,
+                pack,
+                Some(template),
+            );
+            out.unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(named("{title_id} {title}", None), "PPSA01234 Astro Bot");
+        assert_eq!(named("{title} ({pack})", None), "Astro Bot");
+        assert_eq!(
+            named("{title} [{region}] FW{fw}", None),
+            "Astro Bot [USA] FW7.00"
+        );
+        // Template text that fills the room before the title id: the title id names it instead.
+        let crowded = format!("{}{{title_id}}", "X".repeat(63));
+        let got = named(&crowded, None);
+        assert!(got.starts_with("PPSA01234"), "{got}");
+        assert_eq!(named("{title} ({pack})", zstd), "Astro Bot (zstd)");
+        assert_eq!(named("_{title}__{version}.", None), "Astro Bot_01.030.000");
+        let no_version = |name: &str| {
+            let json = format!(r#"{{"titleId":"PPSA01234","titleName":"{name}"}}"#);
+            std::fs::write(game.join("sce_sys/param.json"), json).unwrap();
+        };
+        no_version("Astro Bot");
+        let full = "[{title}]-[{title_id}]-[{version}]";
+        assert_eq!(named(full, None), "[Astro Bot]-[PPSA01234]");
+        assert_eq!(named("{title}-{version}-{pack}", zstd), "Astro Bot-zstd");
+        // A long title is cut to keep it within the limit, the version and pack kind whole.
+        param(&"Long Game Name ".repeat(6));
+        let custom = Some("{title_id} {title} {version} {pack}");
+        let s = stem(
+            &generated_output(&game, Format::Ffpfsc, &root, &[], None, zstd, custom).unwrap(),
+            Format::Ffpfsc,
+        );
+        assert!(s.len() == 58, "{s}");
+        assert!(s.starts_with("PPSA01234 Long Game Name") && s.ends_with(" 01.030.000 zstd"));
+        // Refused templates.
+        for bad in [
+            "{version}-{pack}",
+            "{title}-{name}",
+            "{title}/x",
+            "{title",
+            "x}{title}",
+            "{title}-{title}",
+        ] {
+            assert!(crate::naming_problem(bad).is_some(), "{bad}");
+            let err = generated_output(&game, Format::Folder, &root, &[], None, None, Some(bad));
+            assert!(err.is_err(), "{bad}");
+        }
+        assert_eq!(crate::naming_problem(crate::DEFAULT_NAMING), None);
+        // {title}: the English title, also for a game whose default language is another one.
+        let json = r#"{"titleId":"PPSA01234","localizedParameters":{"defaultLanguage":"ja-JP","ja-JP":{"titleName":"アストロボット"},"en-US":{"titleName":"Astro Bot"}}}"#;
+        std::fs::write(game.join("sce_sys/param.json"), json).unwrap();
+        let name = |t| generated_output(&game, Format::Folder, &root, &[], None, None, Some(t));
+        let file = |t| {
+            name(t)
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(file("{title}-{title_id}"), "Astro Bot-PPSA01234");
+        // An English default language keeps its own title.
+        let json = r#"{"titleId":"PPSA01234","localizedParameters":{"defaultLanguage":"en-GB","en-GB":{"titleName":"Colour Run"},"en-US":{"titleName":"Color Run"}}}"#;
+        std::fs::write(game.join("sce_sys/param.json"), json).unwrap();
+        assert_eq!(file("{title}-{title_id}"), "Colour Run-PPSA01234");
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn empty_dir_is_next_to_the_source() {
-        let root = crate::test_dir("output-dir");
-        let game = root.join("homebrew/game");
-        std::fs::create_dir_all(game.join("sce_sys")).unwrap();
-        std::fs::write(game.join("eboot.bin"), b"x").unwrap();
-        std::fs::write(
-            game.join("sce_sys/param.json"),
-            r#"{"titleId":"PPSA01234","titleName":"Astro Bot"}"#,
-        )
-        .unwrap();
-        // Never a bare name the process's working directory would resolve.
-        let next_to = root.join("homebrew");
-        assert_eq!(
-            generated_output(&game, Format::Ffpkg, Path::new(""), &[], None).unwrap(),
-            next_to.join("[Astro Bot]-[PPSA01234].ffpkg")
-        );
-        assert_eq!(
-            default_output(&game, Format::Exfat, Path::new(""), None).unwrap(),
-            next_to.join("PPSA01234.exfat")
-        );
-        // A trailing separator names the same folder.
-        let slash = PathBuf::from(format!("{}/", game.display()));
-        assert_eq!(
-            default_output(&slash, Format::Exfat, Path::new(""), None).unwrap(),
-            next_to.join("PPSA01234.exfat")
-        );
-        // A trailing `..` is the folder it climbs to (`convert ..`), not its lexical parent.
-        // Compared as folders: Windows' `absolute` resolves `..` itself (keeping 8.3 names
-        // like RUNNER~1), Unix's goes through `canonicalize` (`\\?\` on Windows).
-        let up =
-            default_output(&game.join("sce_sys/.."), Format::Exfat, Path::new(""), None).unwrap();
-        assert_eq!(up.file_name(), Some("PPSA01234.exfat".as_ref()));
-        assert_eq!(
-            up.parent().unwrap().canonicalize().unwrap(),
-            next_to.canonicalize().unwrap()
-        );
-        let _ = std::fs::remove_dir_all(&root);
+    /// A stored (method 0) zip of `files`, written by hand.
+    fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let (mut out, mut central) = (Vec::new(), Vec::new());
+        let u16s = |v: &mut Vec<u8>, xs: &[u16]| xs.iter().for_each(|x| v.extend(x.to_le_bytes()));
+        let u32s = |v: &mut Vec<u8>, xs: &[u32]| xs.iter().for_each(|x| v.extend(x.to_le_bytes()));
+        for (name, data) in files {
+            let (at, crc, len) = (out.len() as u32, crc32fast::hash(data), data.len() as u32);
+            u32s(&mut out, &[0x0403_4b50]);
+            u16s(&mut out, &[20, 0, 0, 0, 0x21]);
+            u32s(&mut out, &[crc, len, len]);
+            u16s(&mut out, &[name.len() as u16, 0]);
+            out.extend(name.as_bytes());
+            out.extend(*data);
+            u32s(&mut central, &[0x0201_4b50]);
+            u16s(&mut central, &[20, 20, 0, 0, 0, 0x21]);
+            u32s(&mut central, &[crc, len, len]);
+            u16s(&mut central, &[name.len() as u16, 0, 0, 0, 0]);
+            u32s(&mut central, &[0, at]);
+            central.extend(name.as_bytes());
+        }
+        let (at, len, n) = (out.len() as u32, central.len() as u32, files.len() as u16);
+        out.extend(central);
+        u32s(&mut out, &[0x0605_4b50]);
+        u16s(&mut out, &[0, 0, n, n]);
+        u32s(&mut out, &[len, at]);
+        u16s(&mut out, &[0]);
+        out
     }
 
     #[test]
-    fn versions_and_titles() {
-        assert_eq!(bcd_version("0x1160000000000000"), "11.60");
-        assert_eq!(bcd_version("0x0700000000000000"), "7.00");
-        assert_eq!(bcd_version("0x0010000000000000"), "0.10");
-        assert_eq!(bcd_version("0x9000038"), "9.00");
-        assert_eq!(bcd_version("0x07500001"), "7.50");
-        assert_eq!(bcd_version("0x1160garbage"), "0x1160garbage");
-        assert_eq!(bcd_version("0x11600000000000000"), "0x11600000000000000");
-        assert_eq!(bcd_version("garbage"), "garbage");
-        let param: Value = serde_json::from_str(
-            r#"{"localizedParameters":{"defaultLanguage":"fr-FR","fr-FR":{"titleName":"Jeu"},
-                "en-US":{"titleName":"Game"}},"titleName":"bare"}"#,
-        )
-        .unwrap();
-        assert_eq!(title_name(&param).as_deref(), Some("Jeu"));
-        let bare: Value = serde_json::from_str(r#"{"titleName":"bare"}"#).unwrap();
-        assert_eq!(title_name(&bare).as_deref(), Some("bare"));
-        let names = title_names(&param);
-        assert_eq!(names.len(), 2);
-        assert_eq!(names["fr-FR"], "Jeu");
-        assert_eq!(names["en-US"], "Game");
-        assert!(title_names(&bare).is_empty());
-        let odd: Value = serde_json::from_str(
-            r#"{"localizedParameters":{"defaultLanguage":"ru-RU","ru-RU":{"titleName":"Игра"},
-                "de-DE":{"titleName":7},"ja-JP":{}}}"#,
-        )
-        .unwrap();
-        let names = title_names(&odd);
-        assert_eq!(names.len(), 1);
-        assert_eq!(names["ru-RU"], "Игра");
+    fn an_archive_is_decoded_once_for_inspect_naming_and_its_password() {
+        use std::sync::atomic::Ordering;
+        let root = crate::test_dir("archive-read-once");
+        let zip = root.join("game.zip");
+        let param: &[u8] = br#"{"titleId":"PPSA01234","titleName":"Astro Bot"}"#;
+        let mut files = vec![
+            ("GAME/eboot.bin", &b"eboot"[..]),
+            ("GAME/sce_sys/param.json", param),
+        ];
+        std::fs::write(&zip, stored_zip(&files)).unwrap();
+        let passes = || crate::archive::READ_PASSES.load(Ordering::Relaxed);
+        let start = passes();
+        let found = inspect(&zip, None).unwrap();
+        assert_eq!(found.title_id.as_deref(), Some("PPSA01234"));
+        assert_eq!(passes() - start, 1, "inspect decodes once");
+        let named = generated_output(&zip, Format::Exfat, &root, &[], None, None, None).unwrap();
+        assert_eq!(named, root.join("[Astro Bot]-[PPSA01234].exfat"));
+        let cancel = AtomicBool::new(false);
+        assert_eq!(crate::archive::password(&zip, None, &cancel).unwrap(), None);
+        assert_eq!(
+            passes() - start,
+            1,
+            "naming and the password read nothing more"
+        );
+        // A changed archive is read again.
+        files.push(("GAME/data.bin", b"more"));
+        std::fs::write(&zip, stored_zip(&files)).unwrap();
+        let file = std::fs::File::options().write(true).open(&zip).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        file.set_modified(later).unwrap();
+        let named = default_output(&zip, Format::Exfat, &root, None).unwrap();
+        assert_eq!(named, root.join("PPSA01234.exfat"));
+        assert_eq!(passes() - start, 2, "a changed archive is decoded again");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A manifest tree that only ever serves its header.

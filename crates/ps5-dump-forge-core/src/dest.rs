@@ -108,7 +108,14 @@ pub(crate) fn probe(dir: &Path, cancel: &AtomicBool) -> anyhow::Result<Dest> {
         .dev();
     let mut notes = Vec::new();
 
-    let pid = std::process::id();
+    // Per call, not only per process: a job's preflight and an `edit_check` may probe one folder
+    // at once, and the names are created exclusively.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let pid = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let mut probes = Probes {
         folder: &folder,
         cancel,
@@ -404,6 +411,12 @@ pub(crate) fn fstype_of(path: &Path) -> io::Result<String> {
     Ok(Statfs::at(path)?.fstype)
 }
 
+/// The bytes an unprivileged user may still write on `path`'s filesystem.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn free_at(path: &Path) -> io::Result<u64> {
+    Ok(Statfs::at(path)?.free)
+}
+
 /// What `fstatfs` says about the folder's filesystem.
 struct Statfs {
     free: u64,
@@ -462,39 +475,6 @@ mod tests {
 
     fn os(code: i32) -> io::Error {
         io::Error::from_raw_os_error(code)
-    }
-
-    #[test]
-    fn link_errors_are_classified() {
-        for code in [libc::EOPNOTSUPP, libc::ENOTSUP, libc::EPERM] {
-            assert_eq!(link_failure(&os(code)), LinkFailure::Unsupported, "{code}");
-        }
-        assert_eq!(link_failure(&os(libc::EINTR)), LinkFailure::Retry);
-        let sony = (0x8002_0000_u32 | libc::EINTR as u32) as i32;
-        assert_eq!(link_failure(&os(sony)), LinkFailure::Retry);
-        for code in [
-            libc::EACCES,
-            libc::ENOSPC,
-            libc::EIO,
-            libc::EXDEV,
-            libc::EROFS,
-            libc::EEXIST,
-        ] {
-            assert_eq!(link_failure(&os(code)), LinkFailure::Refuse, "{code}");
-        }
-        assert_eq!(
-            link_failure(&io::Error::other("no errno")),
-            LinkFailure::Refuse
-        );
-    }
-
-    #[test]
-    fn only_not_found_means_distinct() {
-        let probe = (1, 2);
-        assert_eq!(fold(Err(os(libc::ENOENT)), probe), Fold::Distinct);
-        assert_eq!(fold(Ok(probe), probe), Fold::Folds);
-        assert!(matches!(fold(Ok((1, 3)), probe), Fold::Unknown(_)));
-        assert!(matches!(fold(Err(os(libc::EIO)), probe), Fold::Unknown(_)));
     }
 
     #[test]

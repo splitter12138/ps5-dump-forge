@@ -44,15 +44,31 @@ pub(crate) struct GameInfo {
     pub param_json: Option<Value>,
     pub title_id: Option<String>,
     pub content_id: Option<String>,
+    /// No `eboot.bin` at the root but a `param.json` with a title id: a DLC, an update or
+    /// another package (by user decision; not a finding).
+    pub additional_content: bool,
 }
+
+/// The finding for a source without `eboot.bin` that isn't additional content either.
+pub(crate) const NO_EBOOT: &str = "eboot.bin is missing at the game root";
+
+/// The finding for additional content converted to a target that needs a game.
+pub(crate) const ADDITIONAL_CONTENT_TARGET: &str =
+    "additional content (no eboot.bin) can only be packaged as fpkg or written to a folder";
+
+/// The finding for a conversion of a patch package.
+pub(crate) const PATCH_SOURCE: &str = "a patch package (LIH) holds only what its update changed, \
+     so it can't be converted: open it in Edit to extract its files";
+
+/// The finding for an edit of a patch package.
+pub(crate) const PATCH_EDIT: &str =
+    "a patch package (LIH) can be browsed and extracted from, not edited";
 
 /// Reads `sce_sys/param.json` (when there is one) and checks the game root's layout.
 pub(crate) fn input(tree: &mut dyn SourceTree) -> (GameInfo, Vec<String>) {
     let mut findings = Vec::new();
     let has = |path: &str| tree.files().iter().find(|f| f.path == path).map(|f| f.size);
-    if has("eboot.bin").is_none() {
-        findings.push("eboot.bin is missing at the game root".to_string());
-    }
+    let no_eboot = has("eboot.bin").is_none();
     let param_size = has("sce_sys/param.json");
     let mut info = GameInfo::default();
     match param_size {
@@ -75,6 +91,10 @@ pub(crate) fn input(tree: &mut dyn SourceTree) -> (GameInfo, Vec<String>) {
             );
         }
     }
+    info.additional_content = no_eboot && info.title_id.is_some();
+    if no_eboot && !info.additional_content {
+        findings.insert(0, NO_EBOOT.to_string());
+    }
     (info, findings)
 }
 
@@ -92,6 +112,7 @@ pub(crate) fn parse_param(bytes: &[u8]) -> GameInfo {
         param_json: Some(json),
         title_id,
         content_id,
+        additional_content: false,
     }
 }
 
@@ -110,6 +131,9 @@ fn is_title_id(id: &str) -> bool {
 
 /// The output as an absolute path whose parent exists. The `.part` goes next to it.
 pub(crate) fn output_path(output: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(why) = crate::net::output_refusal(output) {
+        bail!("{why}");
+    }
     let Some(name) = output.file_name() else {
         bail!("{} does not name a file or folder", output.display());
     };
@@ -117,8 +141,8 @@ pub(crate) fn output_path(output: &Path) -> anyhow::Result<PathBuf> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let parent = parent
-        .canonicalize()
+    // Plain `C:\x` on Windows, not `\\?\C:\x`: it is the job's reported output.
+    let parent = dunce::canonicalize(parent)
         .with_context(|| format!("output folder {}", parent.display()))?;
     if !parent.is_dir() {
         bail!("{} is not a folder", parent.display());
@@ -161,7 +185,7 @@ pub(crate) fn stem_limit(format: Format) -> usize {
 /// `output` is absolute (from [`output_path`]).
 pub(crate) fn output(source: &Path, output: &Path, format: Format) -> Vec<String> {
     let mut findings = Vec::new();
-    if output.symlink_metadata().is_ok() {
+    if crate::net::exists(output) {
         findings.push(format!("{} already exists", output.display()));
     }
     if let Some(ext) = extension(format) {
@@ -173,31 +197,17 @@ pub(crate) fn output(source: &Path, output: &Path, format: Format) -> Vec<String
             ));
         }
     }
-    let name = output.file_name().unwrap_or_default().to_string_lossy();
-    // A file's stem as SMP takes it: up to the last dot; a folder's whole name.
-    let stem = match format {
-        Format::Folder | Format::Lz4 => &*name,
-        _ => name.rsplit_once('.').map_or(&*name, |(stem, _)| stem),
-    };
-    let max = stem_limit(format);
-    if stem.len() > max {
-        findings.push(match extension(format) {
-            Some(ext @ ("exfat" | "ffpkg" | "ffpfs" | "ffpfsc")) => format!(
-                "{name} is {} bytes long without its .{ext}: ShadowMountPlus fails to mount a \
-                 .{ext} whose name is over {max} bytes (UTF-8, extension excluded), as its mount \
-                 point would pass the PS5's 87-byte limit",
-                stem.len()
-            ),
-            Some(ext) => format!(
-                "{name} is {} bytes long without its .{ext}: output names are at most {max} \
-                 bytes (UTF-8, extension excluded)",
-                stem.len()
-            ),
-            None => format!(
-                "{name} is {} bytes long: output names are at most {max} bytes (UTF-8)",
-                stem.len()
-            ),
-        });
+    findings.extend(stem_finding(output, format));
+    if let (Ok(source), Ok(out)) = (
+        crate::remote::FlinkPath::parse(source),
+        crate::remote::FlinkPath::parse(output),
+    ) && out.within(&source)
+    {
+        findings.push(format!(
+            "{} is inside the source {}",
+            output.display(),
+            source.url().display()
+        ));
     }
     if let Ok(source) = source.canonicalize()
         && source.is_dir()
@@ -210,6 +220,34 @@ pub(crate) fn output(source: &Path, output: &Path, format: Format) -> Vec<String
         ));
     }
     findings
+}
+
+/// Why `path`'s name is too long for a `format` output ([`stem_limit`]), if it is.
+pub(crate) fn stem_finding(path: &Path, format: Format) -> Option<String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    // A file's stem as SMP takes it: up to the last dot; a folder's whole name.
+    let stem = match format {
+        Format::Folder | Format::Lz4 => &*name,
+        _ => name.rsplit_once('.').map_or(&*name, |(stem, _)| stem),
+    };
+    let max = stem_limit(format);
+    (stem.len() > max).then(|| match extension(format) {
+        Some(ext @ ("exfat" | "ffpkg" | "ffpfs" | "ffpfsc")) => format!(
+            "{name} is {} bytes long without its .{ext}: ShadowMountPlus fails to mount a \
+                 .{ext} whose name is over {max} bytes (UTF-8, extension excluded), as its mount \
+                 point would pass the PS5's 87-byte limit",
+            stem.len()
+        ),
+        Some(ext) => format!(
+            "{name} is {} bytes long without its .{ext}: output names are at most {max} \
+                 bytes (UTF-8, extension excluded)",
+            stem.len()
+        ),
+        None => format!(
+            "{name} is {} bytes long: output names are at most {max} bytes (UTF-8)",
+            stem.len()
+        ),
+    })
 }
 
 /// Whether `path` (absolute) lies inside the folder `dir`. Compared by identity, not by
@@ -265,6 +303,8 @@ pub(crate) fn estimate(tree: &dyn SourceTree) -> u64 {
 pub(crate) struct Destination {
     pub findings: Vec<String>,
     pub notes: Vec<String>,
+    /// The folder's free bytes, when they could be read.
+    pub free: Option<u64>,
     /// What the probe saw, for folder findings and publishing; None when it failed (then
     /// `findings` says why).
     #[cfg(target_os = "freebsd")]
@@ -277,8 +317,10 @@ pub(crate) struct Destination {
 pub(crate) fn destination(dir: &Path, need: u64, largest: u64, _: &AtomicBool) -> Destination {
     let mut findings = Vec::new();
     let mut notes = Vec::new();
+    let mut room = None;
     match fs_stat(dir) {
         Ok((free, fat)) => {
+            room = Some(free);
             if need > free {
                 findings.push(format!(
                     "not enough space in {}: about {} MiB needed, {} MiB free",
@@ -304,7 +346,11 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, _: &AtomicBool) -
             dir.display()
         )),
     }
-    Destination { findings, notes }
+    Destination {
+        findings,
+        notes,
+        free: room,
+    }
 }
 
 /// The same checks on what the destination probe saw (U1 in ps5/README.md). A USB drive is
@@ -317,6 +363,7 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, cancel: &AtomicBo
             return Destination {
                 findings: vec![format!("{e:#}")],
                 notes: Vec::new(),
+                free: None,
                 dest: None,
             };
         }
@@ -349,6 +396,7 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, cancel: &AtomicBo
     Destination {
         findings,
         notes,
+        free: Some(dest.free),
         dest: Some(dest),
     }
 }
@@ -388,7 +436,7 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
 /// (free bytes for an unprivileged user, whether the filesystem is FAT). The FAT answer can
 /// fail on its own (Windows asks the volume root separately).
 #[cfg(target_os = "macos")]
-fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
+pub(crate) fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
     let c = c_path(dir)?;
     // SAFETY: `c` is a valid C string and `st` a properly sized out-parameter.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
@@ -407,7 +455,7 @@ fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_cast)] // field widths differ between Linux targets
-fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
+pub(crate) fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
     const MSDOS_SUPER_MAGIC: i64 = 0x4d44;
     let c = c_path(dir)?;
     // SAFETY: `c` is a valid C string and both out-parameters are properly sized.
@@ -425,7 +473,7 @@ fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
 
 /// FAT12/16/32 report `FAT` or `FAT32`; exFAT has no 4 GiB limit.
 #[cfg(windows)]
-fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
+pub(crate) fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
     let free = crate::win::free_bytes(dir)?;
     let fat = crate::win::fs_name(dir).map(|name| matches!(name.as_str(), "FAT" | "FAT32"));
     Ok((free, fat))
@@ -439,7 +487,7 @@ fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
     windows,
     target_os = "freebsd"
 )))]
-fn fs_stat(_: &Path) -> io::Result<(u64, io::Result<bool>)> {
+pub(crate) fn fs_stat(_: &Path) -> io::Result<(u64, io::Result<bool>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "not implemented on this OS",
@@ -449,19 +497,6 @@ fn fs_stat(_: &Path) -> io::Result<(u64, io::Result<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn title_id_from_param() {
-        let info = parse_param(
-            b"\xef\xbb\xbf{\"titleId\":\"PPSA01234\",\"contentId\":\"UP0000-PPSA01234_00-X\"}",
-        );
-        assert_eq!(info.title_id.as_deref(), Some("PPSA01234"));
-        let info = parse_param(b"{\"contentId\":\"UP0000-PPSA05555_00-X\"}");
-        assert_eq!(info.title_id.as_deref(), Some("PPSA05555"));
-        let info = parse_param(b"{\"titleId\":\"../../etc\"}");
-        assert_eq!(info.title_id, None);
-        assert!(parse_param(b"not json").param_json.is_none());
-    }
 
     #[test]
     fn folder_names_follow_the_probe() {

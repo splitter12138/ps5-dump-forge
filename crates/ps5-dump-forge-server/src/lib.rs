@@ -3,21 +3,40 @@
 //! per connection, and the page polls `GET /api/jobs` (no server push). The rules (limits,
 //! routes) are in ps5/README.md, "Web server".
 //!
-//! No protections, by decision: no pairing, no Host/Origin checks, no path confinement. It
+//! No protections, by decision: no pairing, no Host/Origin checks, no path confinement (but
+//! on the PS5 listings reach only `/data` and the drives plugged in, by user request). It
 //! behaves like the Tauri commands over HTTP, for anyone (and any web page in a browser) that
 //! can reach it on the network.
 
 mod api;
+// Connect (Forge ↔ Forge over FLINK, discovery, saved NAS devices): public for the desktop app, which runs
+// the same service without the HTTP server.
+pub mod connect;
+pub mod connect_fs;
+// Jobs mirrored to the paired peers they use (read only there; the peer may cancel them).
+pub mod connect_jobs;
 // PS5 bring-up only (and only with FORGE_DEBUG_API set): never built for a desktop target.
 #[cfg(target_env = "ps5")]
 mod debug;
+// Connect's discovery: Forge (UDP 8094) and NAS (mDNS; Windows PCs: wsd.rs).
+// A few helpers (`address`, `keepalive`, ...) only tests use yet.
+#[allow(dead_code)]
+mod discovery;
 mod http;
+mod mdns;
+// Connect's saved NAS devices.
+pub mod nas;
 mod notice;
 mod paths;
+pub mod payload;
+// Connect's smart Pair by address: what answers at an address (Forge, SMB, NFS or FTP).
+pub mod probe;
 // The payload's copy of its own ELF (`ps5/build.sh` stage 2).
 #[cfg(any(all(test, unix), target_env = "ps5"))]
 mod self_copy;
 mod table;
+// Connect's Discover: Windows PCs by WS-Discovery.
+mod wsd;
 // Unix: the owner file names the title folder by (st_dev, st_ino).
 #[cfg(any(all(test, unix), target_env = "ps5"))]
 mod tile;
@@ -30,13 +49,16 @@ use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
 
+/// Forge's home folder on the PS5 (`ps5/entry.c`'s `FORGE_DIR`): the self copy, the tile's
+/// owner record, Connect's data and the settings the console keeps.
+pub const FORGE_DIR: &str = "/data/dumpforge";
+
 /// Where the PS5's file browser starts: `/data`, and each drive while a filesystem is mounted
-/// on it (re-checked each time, for hot-plugged drives); `/mnt/shadowmnt` while it exists:
-/// ShadowMountPlus mounts each image under it (`<stem>_<8 hex>`, `.ffpfsc` under `pfsc/`), so
-/// a mounted traced image can be picked as a folder.
-pub const PS5_ROOTS: [&str; 12] = [
+/// on it (re-checked each time, for hot-plugged drives). By user request they are all it
+/// reaches: a listing, and a paired device, refuses any other path (`paths::Roots::confine`);
+/// not `/mnt/shadowmnt` either.
+pub const PS5_ROOTS: [&str; 11] = [
     "/data",
-    "/mnt/shadowmnt",
     "/mnt/usb0",
     "/mnt/usb1",
     "/mnt/usb2",
@@ -69,8 +91,8 @@ pub enum Platform {
 
 pub struct Options {
     pub port: u16,
-    /// The file browser's starting points (`list_dir` with a `null` path); they confine
-    /// nothing.
+    /// The file browser's starting points (`list_dir` with a `null` path); on the PS5 also
+    /// all that listings and paired devices reach.
     pub roots: Vec<PathBuf>,
     pub platform: Platform,
     /// Shows the user a line: the URL, "can't close", "stopped".
@@ -87,6 +109,14 @@ pub struct Options {
     /// The loader `POST /api/self_update` asks to fetch and start a release (elfldr on
     /// `127.0.0.1:9021`; tests point it at a fake).
     pub elfldr: SocketAddr,
+    /// Connect's data folder (node secret, peers); `None` runs no Connect service (tests). The
+    /// CLI's `serve` passes [`connect::default_dir`].
+    pub connect_dir: Option<PathBuf>,
+    /// Connect's FLINK port: 9883, or `FORGE_FLINK_PORT` (local tests of two copies; 0 = any).
+    pub connect_port: u16,
+    /// Where settings are kept (the job notifications' `notifications.off` marker); `None`
+    /// keeps them in memory only (tests). The CLI's `serve` passes [`FORGE_DIR`] on the PS5.
+    pub settings_dir: Option<PathBuf>,
 }
 
 impl Options {
@@ -105,7 +135,13 @@ impl Options {
             write_timeout: Duration::from_secs(30),
             exit: Arc::new(|code| std::process::exit(code)),
             interrupt: None,
-            elfldr: SocketAddr::from((Ipv4Addr::LOCALHOST, 9021)),
+            elfldr: SocketAddr::from((Ipv4Addr::LOCALHOST, ps5_dump_forge_updater::PORT)),
+            connect_dir: None,
+            connect_port: std::env::var("FORGE_FLINK_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(connect::PORT),
+            settings_dir: None,
         }
     }
 }
@@ -139,8 +175,7 @@ fn bind(port: u16) -> io::Result<TcpListener> {
     TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
 }
 
-/// Another copy (any version) holds the port: asks it to quit if idle (no job queued or running, no trace
-/// download), then binds once its port is free (every 200 ms, up to 30 s) and serves. A busy
+/// Another copy (any version) holds the port: asks it to quit if idle (no job queued or running), then binds once its port is free (every 200 ms, up to 30 s) and serves. A busy
 /// one keeps serving; the notice says how to update.
 fn take_over(opts: Options, peer: &Peer) -> io::Result<()> {
     // A start that can't serve (no usable root) must not stop the one that does.
@@ -155,7 +190,7 @@ fn take_over(opts: Options, peer: &Peer) -> io::Result<()> {
     // A copy without `handover` (v0.1.1 and older) ignores `if_idle` and cancels its jobs on
     // quit: asked only when its job list shows none unfinished.
     // ponytail: a job admitted between the two requests isn't listed yet and gets cancelled,
-    // and a trace download it is streaming is cut; both need someone acting in that instant.
+    // which needs someone acting in that instant.
     let body = match peer.handover {
         true => r#"{"if_idle":true}"#,
         false if idle_by_jobs(port) => "{}",
@@ -216,6 +251,7 @@ pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
     let local = listener.local_addr()?;
     let interrupt = opts.interrupt;
     let server = Arc::new(api::Server::new(opts, local)?);
+    server.wire_install();
     (server.opts.notify)(&started(&server.url, cfg!(target_env = "ps5")));
     #[cfg(target_env = "ps5")]
     eprintln!("ps5-dump-forge serve: listening on {}", server.url);
@@ -246,6 +282,7 @@ pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
             http::busy(stream);
             continue;
         }
+        ps5_dump_forge_flink::tune_buffers(&stream);
         active.fetch_add(1, Ordering::SeqCst);
         let slot = Slot(active.clone());
         let server = server.clone();
@@ -278,17 +315,22 @@ impl Drop for Slot {
     }
 }
 
+/// The address the default route leaves from (a UDP `connect` sends no packet).
+pub(crate) fn local_ip() -> Option<IpAddr> {
+    UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|s| s.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).map(|()| s))
+        .and_then(|s| s.local_addr())
+        .ok()
+        .map(|a| a.ip())
+        .filter(|ip| !ip.is_unspecified())
+}
+
 /// `http://<ip>:<port>`: the listener's own address, or for a wildcard listener the
 /// address the default route leaves from (a UDP `connect` sends no packet).
 // ponytail: `sceNetCtlGetInfo` is the hardware-tested alternative, if this proves unreliable.
 fn console_url(local: SocketAddr, platform: Platform) -> String {
     let ip = if local.ip().is_unspecified() {
-        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .and_then(|s| s.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).map(|()| s))
-            .and_then(|s| s.local_addr())
-            .ok()
-            .map(|a| a.ip())
-            .filter(|ip| !ip.is_unspecified())
+        local_ip()
     } else {
         Some(local.ip())
     };
@@ -360,12 +402,7 @@ fn left(deadline: Instant) -> io::Result<Duration> {
 
 /// Sends `request` and reads the reply until the peer closes, at most `max` bytes, all by
 /// `deadline` (a peer that trickles bytes can't stall the caller).
-pub(crate) fn ask(
-    mut stream: TcpStream,
-    request: &str,
-    deadline: Instant,
-    max: usize,
-) -> io::Result<Vec<u8>> {
+fn ask(mut stream: TcpStream, request: &str, deadline: Instant, max: usize) -> io::Result<Vec<u8>> {
     stream.set_write_timeout(Some(left(deadline)?))?;
     stream.write_all(request.as_bytes())?;
     let (mut reply, mut buf) = (Vec::new(), [0u8; 4096]);

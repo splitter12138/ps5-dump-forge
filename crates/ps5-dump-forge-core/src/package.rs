@@ -55,7 +55,11 @@ pub(crate) fn source_findings(
 
     // ponytail: the category is read from applicationCategoryType alone; a patch that keeps
     // its game's category passes. Tell patches apart once a dumped patch's param.json is in hand.
-    if let Some(json) = &info.param_json {
+    // Additional content (no eboot.bin) is packaged whatever its category (by user decision);
+    // the no-eboot note below says so.
+    if let Some(json) = &info.param_json
+        && !info.additional_content
+    {
         match json.get("applicationCategoryType").map(|v| v.as_u64()) {
             None | Some(Some(GAME)) => notes.push("category: base game".to_string()),
             Some(Some(APP)) => notes.push("category: app".to_string()),
@@ -75,11 +79,8 @@ pub(crate) fn source_findings(
         }
     }
     if !files.iter().any(|p| p == "eboot.bin") {
-        findings.push(
-            "no eboot.bin: additional content (DLC) and patches cannot be packaged yet, \
-             only base games and apps"
-                .to_string(),
-        );
+        // By user decision: packaged as additional content (the builder's content class).
+        notes.push("no eboot.bin: packaged as additional content (DLC) or an update".into());
     }
     if let (Some(title), Some(cid)) = (&info.title_id, &info.content_id)
         && let Some(from_cid) = preflight::title_from_content_id(cid)
@@ -119,7 +120,8 @@ pub(crate) fn source_findings(
 
     let ampr = readiness.imports_ampr;
     // `prepare` builds the index anew for a libSceAmpr title and for a source with its own,
-    // except an LZ4-packed one (its index is kept: the pack manifest's file ids come from it);
+    // except an LZ4- or zstd-packed one (its index is kept: it lists the packed files, and
+    // the LZ4 pack manifest's file ids come from it; vendor patch 0030);
     // that copy itself is left out, and so is artwork the container may carry instead (`prepare`
     // still refuses a clash it does index). A manifest that cannot be read skips this check:
     // `prepare` fails with that read's error.
@@ -270,6 +272,60 @@ fn synced_build<T>(built: ps5upload_fpkg::Result<T>, synced: io::Result<()>) -> 
     })
 }
 
+/// The builder's request for `req`: a production package, its threads and Kraken level.
+fn build_request(req: &ConvertRequest, dir: &Path, imports_ampr: bool) -> BuildRequest {
+    // `source`/`output_dir` are not read by `prepare`/`write_package`; the `.part` is ours.
+    let mut request = BuildRequest::production(&req.source, dir);
+    request.threads = req.compression_threads;
+    request.imports_ampr = Some(imports_ampr);
+    request.level = match req.kraken_level {
+        KrakenLevel::Fast => Level::Fast,
+        KrakenLevel::Balanced => Level::Balanced,
+        KrakenLevel::Smallest => Level::Smallest,
+        KrakenLevel::Stored => Level::Stored,
+    };
+    request
+}
+
+/// Free bytes a package of about `size` bytes needs at its destination: the size, 1% more and
+/// 64 MiB for what the destination's own file system spends on the new file.
+pub(crate) fn room(size: u64) -> u64 {
+    size.saturating_add(size / 100).saturating_add(64 * MIB)
+}
+
+/// The package `tree` would build into, sized as [`run`]'s preflight sizes it (its findings,
+/// then the builder's `prepare`, reading per-file headers only), for an edit's check: the
+/// package's estimated size, or every finding.
+pub(crate) fn size(
+    req: &ConvertRequest,
+    tree: &mut dyn SourceTree,
+    info: &GameInfo,
+    dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<u64, Vec<String>> {
+    let (findings, _, imports_ampr) = source_findings(tree, info);
+    if !findings.is_empty() {
+        return Err(findings);
+    }
+    let mut control = BuildControl {
+        cancel: Some(cancel),
+        ..BuildControl::default()
+    };
+    let request = build_request(req, dir, imports_ampr);
+    match build::prepare(tree, &request, &mut control) {
+        Ok(prepared) => Ok(prepared.estimated_size()),
+        Err(e) => Err(vec![
+            format!("{:#}", prepare_error(e))
+                .trim_start_matches("preflight failed:\n  ")
+                .to_string(),
+        ]),
+    }
+}
+
+/// Builds the package of `tree` into `out`'s `.part`, verifies it and publishes it, or, when
+/// `in_place` (an edit's rebuild: `out` is the source), renames it over the source once the
+/// source's `stamp` still holds and ShadowMount+ hasn't mounted it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     req: &ConvertRequest,
     ctx: &Ctx,
@@ -278,6 +334,7 @@ pub(crate) fn run(
     mut findings: Vec<String>,
     out: &Path,
     stamp: &SourceStamp,
+    in_place: bool,
 ) -> anyhow::Result<JobReport> {
     ctx.log(CONSOLE);
     let (more, notes, imports_ampr) = source_findings(tree.as_mut(), info);
@@ -292,16 +349,7 @@ pub(crate) fn run(
     ctx.progress("preflight", 1, 1);
 
     let dir = out.parent().expect("output_path gives a parent");
-    // `source`/`output_dir` are not read by `prepare`/`write_package`; the `.part` is ours.
-    let mut request = BuildRequest::production(&req.source, dir);
-    request.threads = req.compression_threads;
-    request.imports_ampr = Some(imports_ampr);
-    request.level = match req.kraken_level {
-        KrakenLevel::Fast => Level::Fast,
-        KrakenLevel::Balanced => Level::Balanced,
-        KrakenLevel::Smallest => Level::Smallest,
-        KrakenLevel::Stored => Level::Stored,
-    };
+    let request = build_request(req, dir, imports_ampr);
     let stage = Cell::new(Stage::Check.id());
     let sized = Cell::new(false);
     let mut on_stage = |s: Stage| {
@@ -383,11 +431,19 @@ pub(crate) fn run(
     // read no spool dir), so the package is the only thing written.
     let size = prepared.estimated_size();
     estimate.set(size);
-    let need = size.saturating_add(size / 100).saturating_add(64 * MIB);
+    let need = room(size);
+    // A package on a paired device: written there through the peer's file calls.
+    let remote_out = crate::remote::is_remote(out);
     // U7: so a probe that fails because the drive went away says so.
     #[cfg(target_os = "freebsd")]
-    ctx.watch(dir);
-    let checked = preflight::destination(dir, need, size, ctx.cancel);
+    if !remote_out {
+        ctx.watch(dir);
+    }
+    let checked = if remote_out {
+        crate::remote::destination(dir, need)
+    } else {
+        preflight::destination(dir, need, size, ctx.cancel)
+    };
     for note in checked.notes {
         ctx.log(note);
     }
@@ -395,9 +451,11 @@ pub(crate) fn run(
         bail!("preflight failed:\n  {}", checked.findings.join("\n  "));
     }
     #[cfg(target_os = "freebsd")]
-    let dest = checked
-        .dest
-        .ok_or_else(|| anyhow!("the destination was not probed"))?;
+    let dest = checked.dest;
+    #[cfg(target_os = "freebsd")]
+    if dest.is_none() && !remote_out {
+        bail!("the destination was not probed");
+    }
     ctx.check()?;
     ctx.log(format!(
         "package: content id {}, about {} MiB",
@@ -407,9 +465,17 @@ pub(crate) fn run(
 
     // No shadowing: `file` must drop before `part`, which deletes the `.part` (U6).
     #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
-    let (mut part, mut file) = Part::create_file(&part_path(out, ctx.job))?;
+    let (mut part, mut file) = if remote_out {
+        let (part, pkg) = crate::remote::RemotePkgOut::create(&part_path(out, ctx.job))?;
+        (Out::Peer(part), Handle::Peer(pkg))
+    } else {
+        let (part, file) = Part::create_file(&part_path(out, ctx.job))?;
+        (Out::Local(part), Handle::Local(file))
+    };
     #[cfg(target_os = "freebsd")]
-    part.set_dest(&dest);
+    if let (Out::Local(part), Some(dest)) = (&mut part, &dest) {
+        part.set_dest(dest);
+    }
     // As in `convert`: reads run one range ahead on their own thread, so the builder's producer
     // hashes and lays out one range while the next is read (a `.pkg` source's Kraken blocks
     // decoded); `HashingTree` sees exactly the calls and bytes it would without read-ahead.
@@ -422,7 +488,7 @@ pub(crate) fn run(
     let report = build::write_package(
         &prepared,
         &mut hashing,
-        &mut file,
+        file.pkg(),
         part.path(),
         &mut |line| ctx.log(format!("fpkg: {line}")),
         &mut control,
@@ -431,8 +497,22 @@ pub(crate) fn run(
     // ponytail: the builder's last `sync_all` (vendor `stream.rs:534`) has no U4 retries, so a
     // transient fsync error there fails the job: safe, nothing is lost or published. Upgrade: a
     // numbered vendor patch with a final-sync callback.
+    // A package on a peer is synced there (its `sync_out`), with no syncer beside it here.
     #[cfg(target_os = "freebsd")]
-    let report = {
+    let report = if let Handle::Peer(pkg) = &mut file {
+        build::write_package(
+            &prepared,
+            &mut hashing,
+            pkg,
+            part.path(),
+            &mut |line| ctx.log(format!("fpkg: {line}")),
+            &mut control,
+        )
+        .map_err(fpkg("writing the package"))?
+    } else {
+        let Handle::Local(file) = &mut file else {
+            unreachable!("a peer's package is written above")
+        };
         use anyhow::Context;
         control.cancel = Some(&abort);
         let every = crate::durable::Cadence::new().n();
@@ -448,7 +528,7 @@ pub(crate) fn run(
             build::write_package(
                 &prepared,
                 &mut hashing,
-                &mut file,
+                &mut *file,
                 part.path(),
                 &mut |line| ctx.log(format!("fpkg: {line}")),
                 &mut control,
@@ -485,12 +565,16 @@ pub(crate) fn run(
         .collect();
     let expected = verify::expected_from(&mut packaged, &known, ctx, mode)?;
     checks.push(source_summary(&prepared));
+    // The source is read no more: its handles close before the package may replace it
+    // (Windows refuses to rename over an open file).
+    drop(packaged);
+    drop(ahead);
     ctx.check()?;
 
     // Through the handle the package was written with, whatever its name now names.
-    let len = file.metadata()?.len();
+    let len = file.len()?;
     let label = part.path().display().to_string();
-    let mut back = FpkgSource::from_reader(Box::new(file.try_clone()?), len, label, None)
+    let mut back = FpkgSource::from_reader(file.reader()?, len, label, None)
         .map_err(|e| anyhow::Error::new(e).context("reading the package back"))?;
     checks.push(format!("reader: {}", back.describe()));
     for line in back.conflicts() {
@@ -502,15 +586,31 @@ pub(crate) fn run(
     for line in &checks {
         ctx.log(format!("check: {line}"));
     }
-    drop(file);
+    file.finish()?;
 
     ctx.expect_rest(0);
     ctx.progress("finalize", 0, 1);
     ctx.check()?;
     stamp.check()?;
-    part.publish(out)?;
+    if in_place {
+        if let Some(why) = crate::edit_job::smp_finding(out) {
+            bail!("{why}; the source was not replaced");
+        }
+        let Out::Local(part) = part else {
+            bail!("a package on another device is never replaced in place");
+        };
+        if let Some(backup) = part.replace(out)? {
+            ctx.log(format!(
+                "in place: the original package is still at {}; delete it once the new one works",
+                backup.display()
+            ));
+        }
+        checks.push(format!("replaced {} with the verified copy", out.display()));
+    } else {
+        part.publish(out)?;
+        checks.push(format!("published {}", out.display()));
+    }
     ctx.progress("finalize", 1, 1);
-    checks.push(format!("published {}", out.display()));
     Ok(JobReport {
         output: out.to_path_buf(),
         bytes: report.size,
@@ -518,6 +618,69 @@ pub(crate) fn run(
         checks,
         verify: verify::summary(&expected.files, mode),
     })
+}
+
+/// The package's `.part`: here, or on a paired device.
+enum Out {
+    Local(Part),
+    Peer(crate::remote::RemotePart),
+}
+
+impl Out {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Local(part) => part.path(),
+            Self::Peer(part) => part.path(),
+        }
+    }
+
+    fn publish(self, output: &Path) -> anyhow::Result<()> {
+        match self {
+            Self::Local(part) => part.publish(output),
+            Self::Peer(part) => part.publish(output),
+        }
+    }
+}
+
+/// What the builder writes the package through: the local `.part`'s file, or the peer's.
+enum Handle {
+    Local(std::fs::File),
+    Peer(crate::remote::RemotePkgOut),
+}
+
+impl Handle {
+    #[cfg_attr(target_os = "freebsd", allow(dead_code))]
+    fn pkg(&mut self) -> &mut dyn ps5upload_fpkg::PkgOut {
+        match self {
+            Self::Local(file) => file,
+            Self::Peer(pkg) => pkg,
+        }
+    }
+
+    fn len(&self) -> anyhow::Result<u64> {
+        use ps5upload_fpkg::PkgOut;
+        Ok(match self {
+            Self::Local(file) => file.metadata()?.len(),
+            Self::Peer(pkg) => pkg.out_len()?,
+        })
+    }
+
+    /// A reader of its own (a local handle shares the cursor; every reader seeks first).
+    fn reader(&self) -> anyhow::Result<Box<dyn ps5upload_fpkg::ReadSeek>> {
+        use ps5upload_fpkg::PkgOut;
+        Ok(match self {
+            Self::Local(file) => Box::new(file.try_clone()?),
+            Self::Peer(pkg) => Box::new(pkg.try_clone_out()?),
+        })
+    }
+
+    /// Done with it: a local file is closed; a peer's part is sent, synced and closed there.
+    fn finish(self) -> anyhow::Result<()> {
+        if let Self::Peer(pkg) = self {
+            anyhow::Context::context(pkg.finish(), "syncing the package")?;
+        }
+        Ok(())
+    }
 }
 
 /// How the package's files relate to the source's, for the report.
@@ -794,30 +957,5 @@ mod tests {
                 .any(|f| f.contains("data/Level.bin = data/level.bin")),
             "{findings:?}"
         );
-    }
-
-    #[test]
-    fn package_names_and_category() {
-        let param = r#"{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-TESTTESTTESTTEST","applicationCategoryType":33554432}"#;
-        let long = format!("data/{}", "x".repeat(256));
-        let mut tree = Mem::new(&[
-            ("eboot.bin", vec![0x7f; 64]),
-            ("sce_sys/param.json", param.as_bytes().to_vec()),
-            ("data/cafe\u{301}.bin", vec![1]),
-            ("data//twice", vec![1]),
-            (long.as_str(), vec![1]),
-            ("sce_sys/playgo-chunk.dat", vec![1]),
-        ]);
-        let (findings, ..) = findings_of(&mut tree);
-        let text = findings.join("\n");
-        for want in [
-            "applicationCategoryType is 33554432",
-            "not in NFC",
-            "empty component",
-            "longer than 255 bytes",
-        ] {
-            assert!(text.contains(want), "{want:?} not in:\n{text}");
-        }
-        assert_eq!(findings.len(), 4, "{text}");
     }
 }

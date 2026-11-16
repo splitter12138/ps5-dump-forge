@@ -1,0 +1,46 @@
+# PS5 Dump Forge — local build (no BuildKit required)
+# Use: docker build -t ps5-dump-forge -f Dockerfile.local .
+
+# ---- Stage 1: Build the web UI (app/dist-http) -------------------------------
+FROM node:22-slim AS web
+WORKDIR /app
+COPY app/package.json app/package-lock.json ./
+RUN npm ci
+COPY app/ ./
+RUN npm run build:http
+
+# ---- Stage 2: Build the Rust CLI with the web UI embedded --------------------
+FROM rust:1.100.0-slim-trixie AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential g++ pkg-config make ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+COPY --from=web /app/dist-http app/dist-http
+RUN rm -f rust-toolchain.toml
+
+ENV FORGE_REQUIRE_WEB=1
+RUN cargo build --release --locked -p ps5-dump-forge-cli \
+    && cp /build/target/release/ps5-dump-forge /build/ps5-dump-forge
+
+# ---- Stage 3: Minimal runtime -----------------------------------------------
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libstdc++6 libgcc-s1 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/ps5-dump-forge /usr/local/bin/ps5-dump-forge
+
+RUN mkdir -p /data
+VOLUME ["/data"]
+
+EXPOSE 8095
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
+    CMD curl -sf http://localhost:8095/ >/dev/null || exit 1
+
+ENTRYPOINT ["ps5-dump-forge"]
+CMD ["serve", "--port", "8095", "--root", "/data"]

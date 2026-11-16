@@ -20,7 +20,9 @@ dist/
 fuzz/
 
 # PS5 payload harness (Docker, C entry points, SDK — not needed for the Linux build)
+# Keep ps5/icon0.png: notice.rs embeds it via include_bytes!
 ps5/
+!ps5/icon0.png
 
 # IDE / editor
 .vscode/

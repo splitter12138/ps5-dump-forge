@@ -24,7 +24,7 @@ COPY app/ ./
 RUN npm run build:http
 
 # ---- Stage 2: Build the Rust CLI with the web UI embedded --------------------
-FROM rust:1.99.0-slim-trixie AS builder
+FROM rust:1.100.0-slim-trixie AS builder
 
 # build-essential + g++: UnRAR's C++ source (unrar_sys) and the archive ABI check (cc crate).
 # make: unrar_sys build system. pkg-config: conventional, some crates probe for it.
@@ -40,7 +40,7 @@ COPY . .
 COPY --from=web /app/dist-http app/dist-http
 
 # The repo's rust-toolchain.toml pins macOS targets we don't need on Linux;
-# removing it lets cargo use this image's default toolchain (1.99.0).
+# removing it lets cargo use this image's default toolchain (1.100.0).
 RUN rm -f rust-toolchain.toml
 
 # FORGE_REQUIRE_WEB=1: build.rs fails if app/dist-http/index.html is missing,
